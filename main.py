@@ -1,18 +1,43 @@
 import json
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import api_futbol
 
-app = FastAPI(title="Panel Estadístico Draftea Pro")
+app = FastAPI(title="Predicciones Irvingisllo")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Catálogo global unificado de IDs de API-Football
 LIGAS_API_IDS = {
-    "Liga MX": 262,
-    "Premier League": 39,
-    "LaLiga EA Sports": 140
+    "Liga MX (México)": 262,
+    "Premier League (Inglaterra)": 39,
+    "La Liga (España)": 140,
+    "Serie A (Italia)": 135,
+    "Bundesliga (Alemania)": 78,
+    "Ligue 1 (Francia)": 61,
+    "MLS (Estados Unidos)": 253,
+    "Champions League": 2,
+    "Europa League": 3,
+    "Copa Libertadores": 13,
+    "Brasileirão (Brasil)": 71,
+    "Primera División (Argentina)": 128,
+    "Primeira Liga (Portugal)": 94,
+    "Eredivisie (Países Bajos)": 88,
+    "Mundial (FIFA)": 1,
+    "Copa América": 9,
+    "Eurocopa": 4
 }
 
+# Base de datos de equipos y proyecciones DFS (Las ligas nuevas inician vacías para evitar errores)
 LIGAS_CONFIG = {
-    "Liga MX": {
+    "Liga MX (México)": {
         "Club América": {"query": "Club America", "figura": "Henry Martín (DEL)", "pts": "18.5 pts", "xg": "0.65", "tiros": "3.4", "tiros_arco": "1.8", "xa": "0.30"},
         "Atlas": {"query": "Atlas", "figura": "Eduardo Aguirre (DEL)", "pts": "12.0 pts", "xg": "0.38", "tiros": "2.2", "tiros_arco": "0.9", "xa": "0.15"},
         "Atlético San Luis": {"query": "Atletico San Luis", "figura": "Fran Boli (DEL)", "pts": "13.2 pts", "xg": "0.45", "tiros": "2.5", "tiros_arco": "1.1", "xa": "0.12"},
@@ -32,16 +57,30 @@ LIGAS_CONFIG = {
         "Toluca": {"query": "Toluca", "figura": "Paulinho (DEL)", "pts": "18.1 pts", "xg": "0.68", "tiros": "3.5", "tiros_arco": "1.8", "xa": "0.22"},
         "Club Tijuana (Xolos)": {"query": "Tijuana", "figura": "Efraín Álvarez (MED)", "pts": "13.0 pts", "xg": "0.28", "tiros": "2.3", "tiros_arco": "0.9", "xa": "0.36"}
     },
-    "Premier League": {
+    "Premier League (Inglaterra)": {
         "Arsenal": {"query": "Arsenal", "figura": "Bukayo Saka (DEL)", "pts": "19.2 pts", "xg": "0.52", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.48"},
         "Chelsea": {"query": "Chelsea", "figura": "Cole Palmer (MED)", "pts": "21.0 pts", "xg": "0.65", "tiros": "3.6", "tiros_arco": "1.8", "xa": "0.50"},
         "Liverpool": {"query": "Liverpool", "figura": "Mohamed Salah (DEL)", "pts": "20.4 pts", "xg": "0.70", "tiros": "3.8", "tiros_arco": "1.9", "xa": "0.42"},
         "Manchester City": {"query": "Manchester City", "figura": "Erling Haaland (DEL)", "pts": "22.5 pts", "xg": "0.95", "tiros": "4.2", "tiros_arco": "2.4", "xa": "0.12"}
     },
-    "LaLiga EA Sports": {
+    "La Liga (España)": {
         "Real Madrid": {"query": "Real Madrid", "figura": "Vinicius Jr (DEL)", "pts": "20.8 pts", "xg": "0.68", "tiros": "3.7", "tiros_arco": "1.8", "xa": "0.44"},
         "FC Barcelona": {"query": "Barcelona", "figura": "Lamine Yamal (DEL)", "pts": "19.5 pts", "xg": "0.48", "tiros": "3.3", "tiros_arco": "1.4", "xa": "0.52"}
-    }
+    },
+    "Serie A (Italia)": {},
+    "Bundesliga (Alemania)": {},
+    "Ligue 1 (Francia)": {},
+    "MLS (Estados Unidos)": {},
+    "Champions League": {},
+    "Europa League": {},
+    "Copa Libertadores": {},
+    "Brasileirão (Brasil)": {},
+    "Primera División (Argentina)": {},
+    "Primeira Liga (Portugal)": {},
+    "Eredivisie (Países Bajos)": {},
+    "Mundial (FIFA)": {},
+    "Copa América": {},
+    "Eurocopa": {}
 }
 
 @app.get("/", response_class=HTMLResponse)
@@ -65,17 +104,14 @@ def leer_raiz():
             select:focus {{ outline: none; border-color: #38bdf8; }}
             .btn {{ background: #00ff87; color: #052e16; font-weight: bold; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 15px; width: 100%; transition: 0.2s; }}
             .btn:hover {{ background: #34d399; }}
-            
             .carousel {{ display: flex; gap: 12px; overflow-x: auto; padding-bottom: 15px; margin-bottom: 25px; scrollbar-width: thin; }}
             .match-card {{ background: #16203a; border: 1px solid #233154; padding: 12px; border-radius: 10px; min-width: 170px; cursor: pointer; text-align: center; transition: 0.2s; }}
             .match-card:hover {{ border-color: #00ff87; transform: translateY(-2px); }}
-            
             .match-header {{ display: flex; justify-content: space-between; align-items: center; margin-top: 25px; background: #16203a; border-radius: 12px 12px 0 0; padding: 20px; border: 1px solid #233154; border-bottom: none; }}
             .team-side {{ display: flex; flex-direction: column; align-items: center; width: 40%; }}
             .team-logo {{ width: 64px; height: 64px; object-fit: contain; margin-bottom: 8px; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.4)); }}
             .team-name {{ font-size: 15px; font-weight: bold; text-align: center; color: #f8fafc; }}
             .vs-badge {{ background: #0b1329; border: 1px solid #38bdf8; color: #38bdf8; font-weight: bold; padding: 4px 10px; border-radius: 20px; font-size: 12px; }}
-
             .stat-table {{ width: 100%; background: #16203a; border-collapse: collapse; border: 1px solid #233154; }}
             .stat-row {{ display: flex; justify-content: space-between; align-items: center; padding: 9px 16px; border-top: 1px solid #1e293b; font-size: 13px; }}
             .stat-row:nth-child(even) {{ background: #111a30; }}
@@ -83,7 +119,6 @@ def leer_raiz():
             .stat-name {{ width: 50%; text-align: center; color: #38bdf8; font-weight: 600; text-transform: capitalize; font-size: 12px; }}
             .stat-val-v {{ font-weight: bold; width: 25%; text-align: right; }}
             .pill {{ background: #0284c7; color: white; padding: 2px 8px; border-radius: 4px; display: inline-block; }}
-
             .dfs-section {{ background: #16203a; border: 1px solid #233154; border-radius: 0 0 12px 12px; padding: 18px; margin-bottom: 30px; }}
             .dfs-title {{ font-size: 12px; font-weight: bold; color: #00ff87; text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.5px; }}
             .dfs-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
@@ -108,7 +143,6 @@ def leer_raiz():
                 </select>
             </div>
 
-            <!-- Cartelera Oficial de Partidos -->
             <label style="color:#00ff87; margin-top:20px;">Próxima Jornada (Clickea para analizar)</label>
             <div id="cartelera" class="carousel"></div>
 
@@ -138,6 +172,14 @@ def leer_raiz():
 
                 selectLocal.innerHTML = '';
                 selectVisita.innerHTML = '';
+
+                if (equipos.length === 0) {{
+                    const opt = document.createElement('option');
+                    opt.textContent = "Equipos pendientes de configurar";
+                    selectLocal.appendChild(opt.cloneNode(true));
+                    selectVisita.appendChild(opt);
+                    return;
+                }}
 
                 equipos.forEach((eq, index) => {{
                     const optL = document.createElement('option');
@@ -202,7 +244,7 @@ def leer_raiz():
                 if(foundL && foundV) {{
                     cargarAnalisis();
                 }} else {{
-                    alert("Aún no tienes los jugadores clave (DFS) configurados en la base para uno de estos equipos.");
+                    alert("Aún no tienes los jugadores clave (DFS) configurados en la base de datos local para uno de estos equipos.");
                 }}
             }}
 
@@ -221,6 +263,11 @@ def leer_raiz():
                 const local = document.getElementById('local').value;
                 const visita = document.getElementById('visita').value;
                 const contenedor = document.getElementById('resultado');
+
+                if (!local || !visita || local === "Equipos pendientes de configurar") {{
+                    contenedor.innerHTML = "<p style='color: #f87171; margin-top: 15px;'>Faltan equipos por registrar en la base de datos.</p>";
+                    return;
+                }}
 
                 if (local === visita) {{
                     contenedor.innerHTML = "<p style='color: #f87171; margin-top: 15px;'>Elige dos equipos diferentes.</p>";
@@ -265,11 +312,9 @@ def leer_raiz():
                                 <div class="team-name">${{d.visita}}</div>
                             </div>
                         </div>
-
                         <div class="stat-table">
                             ${{filasHTML}}
                         </div>
-
                         <div class="dfs-section">
                             <div class="dfs-title">Proyección de Jugadores Clave (DFS / Draftea)</div>
                             <div class="dfs-grid">
@@ -319,7 +364,6 @@ def obtener_proximos(liga: str = Query(...)):
         
     partidos = api_futbol.obtener_proximos_partidos(id_liga)
     
-    # Mapa unificado para traducir nombres directos de la API a tus llaves del diccionario local
     mapa_traduccion = {
         "Club America": "Club América",
         "Atletico San Luis": "Atlético San Luis",
@@ -337,7 +381,6 @@ def obtener_proximos(liga: str = Query(...)):
     }
 
     for p in partidos:
-        # Reemplazar nombre de API por tu versión si existe en el mapa, o dejarlo original si cuadra
         p["local_key"] = mapa_traduccion.get(p["local"], p["local"])
         p["visita_key"] = mapa_traduccion.get(p["visita"], p["visita"])
 
@@ -347,13 +390,13 @@ def obtener_proximos(liga: str = Query(...)):
 def obtener_predicciones(liga: str = Query(...), local: str = Query(...), visita: str = Query(...)):
     liga_dict = LIGAS_CONFIG.get(liga)
     if not liga_dict:
-        return {"error": "Liga no reconocida."}
+        return {"error": "Liga no configurada para DFS en el servidor."}
 
     cfg_l = liga_dict.get(local)
     cfg_v = liga_dict.get(visita)
 
     if not cfg_l or not cfg_v:
-        return {"error": "Equipos no válidos."}
+        return {"error": "Equipos pendientes de registrar o sin historial DFS."}
 
     info_club_l = api_futbol.obtener_info_club(cfg_l["query"])
     info_club_v = api_futbol.obtener_info_club(cfg_v["query"])
