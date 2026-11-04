@@ -10,7 +10,8 @@ import os
 import re
 import time
 import unicodedata
-from collections import deque
+from collections import defaultdict, deque
+from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from math import exp, factorial
@@ -34,6 +35,21 @@ API_KEY = next(
 API_BASE = os.getenv("API_BASE", "https://api.football-data.org/v4")
 RATE_POR_MIN = int(os.getenv("RATE_POR_MIN", "9"))  # el plan gratuito permite 10/min
 MAX_ESPERA_SEG = 25
+
+# The Odds API (cuotas). Variable de entorno en Render: ODDS_API_KEY
+ODDS_KEY = os.getenv("ODDS_API_KEY")
+ODDS_BASE = os.getenv("ODDS_BASE", "https://api.the-odds-api.com/v4")
+TTL_CUOTAS = 43200  # 12 h: cuida los créditos del plan gratuito (500 al mes)
+UMBRAL_EV = 0.05    # valor esperado mínimo para marcar "posible valor"
+UMBRAL_DIF = 0.03   # y al menos 3 puntos porcentuales sobre el mercado
+
+SPORT_KEYS = {
+    "PL": "soccer_epl",
+    "PD": "soccer_spain_la_liga",
+    "BL1": "soccer_germany_bundesliga",
+    "CL": "soccer_uefa_champs_league",
+    "SA": "soccer_italy_serie_a",
+}
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
 TTL_CARTELERA = 1800     # 30 min
@@ -147,6 +163,28 @@ class Analisis(BaseModel):
     dfs_visita: Dfs | None = None
     advertencias: list[str] = []
 
+
+
+class Seleccion(BaseModel):
+    mercado: str
+    seleccion: str
+    prob_modelo: float
+    prob_mercado: float   # consenso de las casas, sin margen
+    diferencia: float     # prob_modelo - prob_mercado
+    mejor_cuota: float
+    casa: str | None = None
+    ev: float             # valor esperado con la mejor cuota: prob_modelo * cuota - 1
+    casas: int = 0
+    posible_valor: bool = False
+
+
+class Valor(BaseModel):
+    disponible: bool
+    evento: str | None = None
+    comienza: str | None = None
+    selecciones: list[Seleccion] = []
+    creditos_restantes: int | None = None
+    advertencias: list[str] = []
 
 # =====================================================================
 # 2. PROYECCIONES DFS (manuales). Cada equipo una sola vez.
@@ -389,6 +427,124 @@ class FootballData:
         return (await self._get(f"/matches/{partido_id}/head2head", {"limit": 10}, TTL_H2H)).get("matches", [])
 
 
+class OddsApi:
+    """Cliente de The Odds API. Todo con caché de 12 h para cuidar los créditos."""
+
+    def __init__(self):
+        self.cache = TTLCache()
+        self.creditos: int | None = None
+        self._http = httpx.AsyncClient(base_url=ODDS_BASE, timeout=httpx.Timeout(15.0))
+
+    async def cerrar(self) -> None:
+        await self._http.aclose()
+
+    async def _get(self, path: str, params: dict[str, Any], ttl: int) -> Any:
+        if not ODDS_KEY:
+            raise ApiError(500, "Falta la variable de entorno ODDS_API_KEY en el servidor.")
+        key = (path, tuple(sorted(params.items())))
+
+        async def fetch() -> Any:
+            try:
+                r = await self._http.get(path, params={**params, "apiKey": ODDS_KEY})
+            except httpx.HTTPError as e:
+                raise ApiError(502, f"No se pudo conectar con The Odds API: {e}") from e
+            restantes = r.headers.get("x-requests-remaining")
+            if restantes is not None:
+                try:
+                    self.creditos = int(float(restantes))
+                except ValueError:
+                    pass
+            if r.status_code >= 400:
+                try:
+                    msg = r.json().get("message", "")
+                except Exception:
+                    msg = ""
+                if r.status_code == 401:
+                    raise ApiError(401, f"The Odds API: key inválida o créditos agotados. {msg}")
+                if r.status_code == 429:
+                    raise ApiError(429, "The Odds API: demasiadas peticiones. Intenta en unos segundos.")
+                if r.status_code in (404, 422):
+                    raise ApiError(404, f"The Odds API: no se encontró el recurso. {msg}")
+                raise ApiError(502, f"The Odds API respondió {r.status_code}: {msg}")
+            return r.json()
+
+        return await self.cache.get_or_set(key, ttl, fetch)
+
+    async def eventos_liga(self, sport_key: str) -> list[dict]:
+        params = {"regions": "eu", "markets": "h2h,totals", "oddsFormat": "decimal", "dateFormat": "iso"}
+        return await self._get(f"/sports/{sport_key}/odds", params, TTL_CUOTAS)
+
+    async def btts_evento(self, sport_key: str, evento_id: str) -> dict:
+        params = {"regions": "eu", "markets": "btts", "oddsFormat": "decimal", "dateFormat": "iso"}
+        return await self._get(f"/sports/{sport_key}/events/{evento_id}/odds", params, TTL_CUOTAS)
+
+
+# Nombres que las casas escriben distinto a football-data.org (ya normalizados con clave())
+_ALIAS_CUOTAS = {
+    clave("Athletic Bilbao"): clave("Athletic Club"),
+    clave("Sporting Lisbon"): clave("Sporting Clube de Portugal"),
+}
+
+
+def _mismo_equipo(a: str, b: str) -> bool:
+    ca, cb = clave(a), clave(b)
+    ca, cb = _ALIAS_CUOTAS.get(ca, ca), _ALIAS_CUOTAS.get(cb, cb)
+    if ca == cb:
+        return True
+    ta, tb = ca.split(), cb.split()
+    corto, largo = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    # "Inter Milan" ~ "Internazionale Milano": cada palabra corta es prefijo de una larga
+    if corto and all(any(x.startswith(c) for x in largo) for c in corto):
+        return True
+    return SequenceMatcher(None, ca, cb).ratio() >= 0.85
+
+
+def buscar_evento(eventos: list[dict], local: str, visita: str) -> dict | None:
+    for ev in eventos:
+        if _mismo_equipo(ev.get("home_team", ""), local) and _mismo_equipo(ev.get("away_team", ""), visita):
+            return ev
+    return None
+
+
+def _consenso(bookmakers: list[dict], mercado: str, etiquetas: dict[str, str],
+              punto: float | None = None) -> dict[str, dict]:
+    """Probabilidad de mercado sin margen (promedio entre casas) y mejor cuota por selección."""
+    acum: dict[str, list[float]] = defaultdict(list)
+    mejores: dict[str, tuple[float, str | None]] = {}
+    for b in bookmakers:
+        for mk in b.get("markets", []):
+            if mk.get("key") != mercado:
+                continue
+            outs = [o for o in mk.get("outcomes", [])
+                    if o.get("name") in etiquetas and o.get("price")
+                    and (punto is None or o.get("point") == punto)]
+            if len(outs) != len(etiquetas):
+                continue
+            total = sum(1 / o["price"] for o in outs)  # quita el margen de la casa
+            for o in outs:
+                k = etiquetas[o["name"]]
+                acum[k].append((1 / o["price"]) / total)
+                if k not in mejores or o["price"] > mejores[k][0]:
+                    mejores[k] = (o["price"], b.get("title"))
+    return {k: {"prob_mercado": sum(v) / len(v), "mejor_cuota": mejores[k][0],
+                "casa": mejores[k][1], "casas": len(v)} for k, v in acum.items()}
+
+
+def _armar(mercado: str, modelo: dict[str, tuple[str, float]], consenso: dict[str, dict]) -> list[Seleccion]:
+    res = []
+    for k, (nombre, prob) in modelo.items():
+        c = consenso.get(k)
+        if not c:
+            continue
+        ev = prob * c["mejor_cuota"] - 1
+        dif = prob - c["prob_mercado"]
+        res.append(Seleccion(mercado=mercado, seleccion=nombre, prob_modelo=round(prob, 3),
+                             prob_mercado=round(c["prob_mercado"], 3), diferencia=round(dif, 3),
+                             mejor_cuota=c["mejor_cuota"], casa=c["casa"], ev=round(ev, 3), casas=c["casas"],
+                             posible_valor=ev >= UMBRAL_EV and dif >= UMBRAL_DIF))
+    return res
+
+
 def _norm(m: dict) -> dict:
     """Convierte un partido de football-data.org al formato interno que usan las estadísticas."""
     ft = (m.get("score") or {}).get("fullTime") or {}
@@ -534,10 +690,12 @@ def calcular_probabilidades(fl: Forma, fv: Forma, fl_casa: Forma | None = None,
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.api = FootballData()
+    app.state.odds = OddsApi()
     if not API_KEY:
         logging.warning("FOOTBALL_DATA_KEY no está configurada")
     yield
     await app.state.api.cerrar()
+    await app.state.odds.cerrar()
 
 
 app = FastAPI(title="Panel Estadístico Draftea Pro", version="3.0", lifespan=lifespan)
@@ -553,6 +711,13 @@ def get_api(request: Request) -> FootballData:
 Api = Annotated[FootballData, Depends(get_api)]
 
 
+def get_odds(request: Request) -> OddsApi:
+    return request.app.state.odds
+
+
+Odds = Annotated[OddsApi, Depends(get_odds)]
+
+
 @app.exception_handler(ApiError)
 async def _api_error(_: Request, exc: ApiError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
@@ -566,7 +731,7 @@ def _equipo(t: dict) -> Equipo:
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "api_key_configurada": bool(API_KEY)}
+    return {"ok": True, "api_key_configurada": bool(API_KEY), "odds_key_configurada": bool(ODDS_KEY)}
 
 
 @app.get("/api/ligas")
@@ -593,9 +758,7 @@ async def proximos(liga: str, api: Api, n: Annotated[int, Query(ge=1, le=30)] = 
             for m in pendientes[:n]]
 
 
-@app.get("/api/analisis", response_model=Analisis)
-async def analisis(api: Api, local_id: int, visita_id: int,
-                   partido_id: Annotated[int | None, Query(description="ID de un partido de la cartelera (habilita el H2H)")] = None):
+async def construir_analisis(api: FootballData, local_id: int, visita_id: int, partido_id: int | None) -> Analisis:
     if local_id == visita_id:
         raise HTTPException(422, "Elige dos equipos diferentes")
 
@@ -655,6 +818,47 @@ async def analisis(api: Api, local_id: int, visita_id: int,
         dfs_local=dfs_l, dfs_visita=dfs_v, advertencias=avisos)
 
 
+@app.get("/api/analisis", response_model=Analisis)
+async def analisis(api: Api, local_id: int, visita_id: int,
+                   partido_id: Annotated[int | None, Query(description="ID de un partido de la cartelera (habilita el H2H)")] = None):
+    return await construir_analisis(api, local_id, visita_id, partido_id)
+
+
+@app.get("/api/valor", response_model=Valor)
+async def valor(api: Api, odds: Odds, liga: str, local_id: int, visita_id: int,
+                partido_id: int | None = None):
+    sport = SPORT_KEYS.get(liga)
+    if not sport:
+        raise HTTPException(422, "Cuotas disponibles solo para PL, PD, BL1, CL y SA")
+    an = await construir_analisis(api, local_id, visita_id, partido_id)  # sale de caché si ya se analizó
+    p = an.probabilidades
+    eventos = await odds.eventos_liga(sport)
+    ev = buscar_evento(eventos, an.local.nombre, an.visita.nombre)
+    if not ev or not p:
+        return Valor(disponible=False, creditos_restantes=odds.creditos,
+                     advertencias=["No hay cuotas publicadas para este partido (aún no abren o los nombres no coinciden)."])
+
+    avisos = ["El modelo es simple y el mercado suele ser más preciso: una diferencia grande suele indicar un error del modelo, no una apuesta segura. Úsalo como filtro, no como señal."]
+    sels = _armar("Resultado 1X2",
+                  {"local": (an.local.nombre, p.local), "empate": ("Empate", p.empate), "visita": (an.visita.nombre, p.visita)},
+                  _consenso(ev.get("bookmakers", []), "h2h",
+                            {ev["home_team"]: "local", ev["away_team"]: "visita", "Draw": "empate"}))
+    sels += _armar("Total de goles 2.5",
+                   {"over25": ("Más de 2.5", p.over25), "under25": ("Menos de 2.5", 1 - p.over25)},
+                   _consenso(ev.get("bookmakers", []), "totals", {"Over": "over25", "Under": "under25"}, punto=2.5))
+    try:
+        btts = await odds.btts_evento(sport, ev["id"])
+        sels += _armar("Ambos anotan",
+                       {"btts_si": ("Sí", p.btts), "btts_no": ("No", 1 - p.btts)},
+                       _consenso(btts.get("bookmakers", []), "btts", {"Yes": "btts_si", "No": "btts_no"}))
+    except ApiError as e:
+        avisos.append(f"No se pudo obtener 'ambos anotan': {e.detail}")
+    avisos.append("Mejor cuota = la más alta entre las casas consultadas (región EU); la probabilidad de mercado es el promedio sin margen.")
+
+    return Valor(disponible=True, evento=f"{ev['home_team']} vs {ev['away_team']}", comienza=ev.get("commence_time"),
+                 selecciones=sels, creditos_restantes=odds.creditos, advertencias=avisos)
+
+
 # =====================================================================
 # 7. FRONT (HTML plano, sin f-string)
 # =====================================================================
@@ -697,6 +901,11 @@ td:last-child{text-align:right;font-weight:bold;width:25%}td:nth-child(2){text-a
 .warn{font-size:12px;color:#fbbf24;margin:4px 0}
 .racha span{display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;border-radius:4px;font-size:11px;margin-right:3px}
 .G{background:#16a34a}.E{background:#ca8a04}.P{background:#dc2626}
+.cuotas{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.cuotas input{width:100%;background:#0b1329;border:1px solid #334155;color:#fff;padding:8px;border-radius:6px;font-size:14px}
+.tv{margin-top:6px}.tv th{font-size:11px;color:#94a3b8;text-align:right;padding:4px}.tv th:first-child{text-align:left}
+.tv td{padding:6px 4px;border-top:1px solid #1e293b;text-align:right;font-weight:normal;width:auto;color:#f8fafc}
+.tv td:first-child{text-align:left;font-weight:bold;width:auto}.tv td:nth-child(2){color:#f8fafc;font-size:13px}.tv td:last-child{width:auto;font-weight:bold}
+.tv tr.val td{color:#00ff87;background:#0b1f1a}
 @media(max-width:520px){.dfs{grid-template-columns:1fr}}
 </style></head><body><div class="container">
 <h2>Panel Analítico Draftea ⚽</h2>
@@ -711,10 +920,54 @@ td:last-child{text-align:right;font-weight:bold;width:25%}td:nth-child(2){text-a
 <script>
 const $ = id => document.getElementById(id);
 let partidos = [];
+let oddsOk = false;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nd = x => (x === null || x === undefined) ? 'N/D' : x;
 const pc = x => (x === null || x === undefined) ? 'N/D' : x + '%';
 const fr = x => Math.round(x * 100) + '%';
+function aDecimal(txt) {
+  const t = String(txt || '').trim().replace(',', '.');
+  if (!t) return null;
+  const n = parseFloat(t);
+  if (isNaN(n)) return null;
+  if (/^[+-]/.test(t) && Math.abs(n) >= 100) return n > 0 ? 1 + n / 100 : 1 + 100 / Math.abs(n); // americano
+  return n > 1 ? n : null;
+}
+function valorManual(d, c) {
+  const p = d.probabilidades;
+  const mercados = [
+    ['Resultado 1X2', [[d.local.nombre, p.local, c.l], ['Empate', p.empate, c.e], [d.visita.nombre, p.visita, c.v]]],
+    ['Total de goles 2.5', [['Más de 2.5', p.over25, c.o], ['Menos de 2.5', 1 - p.over25, c.u]]],
+    ['Ambos anotan', [['Sí', p.btts, c.bs], ['No', 1 - p.btts, c.bn]]],
+  ];
+  let h = '', hay = false;
+  for (const [nombre, sels] of mercados) {
+    const filas = sels.filter(s => s[2]);
+    if (!filas.length) continue;
+    hay = true;
+    const completo = filas.length === sels.length;
+    const total = completo ? sels.reduce((a, s) => a + 1 / s[2], 0) : 1; // con todas las cuotas se quita el margen
+    h += `<table class="tv"><tr><th>${esc(nombre)}${completo ? '' : ' (con margen)'}</th><th>Modelo</th><th>Mercado</th><th>Cuota</th><th>EV</th></tr>` +
+      filas.map(([n, prob, cuota]) => {
+        const pm = (1 / cuota) / total, ev = prob * cuota - 1, val = ev >= 0.05 && prob - pm >= 0.03;
+        return `<tr class="${val ? 'val' : ''}"><td>${esc(n)}</td><td>${fr(prob)}</td><td>${fr(pm)}</td><td>${cuota.toFixed(2)}</td><td>${(ev * 100).toFixed(1)}%</td></tr>`;
+      }).join('') + '</table><br>';
+  }
+  if (!hay) return '<p class="muted">Escribe al menos una cuota.</p>';
+  return h + '<div class="warn">⚠ El modelo es simple (sin lesiones ni alineaciones) y el mercado suele ser más preciso: un EV alto suele indicar error del modelo. Úsalo como filtro.</div>';
+}
+function pintarValor(v) {
+  if (!v.disponible) return `<p class="muted">${esc(v.advertencias.join(' '))}</p>`;
+  const grupos = {};
+  v.selecciones.forEach(s => (grupos[s.mercado] = grupos[s.mercado] || []).push(s));
+  let h = `<div class="muted" style="margin:8px 0">${esc(v.evento)} · créditos restantes: ${nd(v.creditos_restantes)}</div>`;
+  for (const [m, filas] of Object.entries(grupos)) {
+    h += `<table class="tv"><tr><th>${esc(m)}</th><th>Modelo</th><th>Mercado</th><th>Mejor cuota</th><th>EV</th></tr>` +
+      filas.map(s => `<tr class="${s.posible_valor ? 'val' : ''}"><td>${esc(s.seleccion)}</td><td>${fr(s.prob_modelo)}</td><td>${fr(s.prob_mercado)}</td>
+        <td>${s.mejor_cuota.toFixed(2)}<br><span class="muted">${esc(s.casa)}</span></td><td>${(s.ev * 100).toFixed(1)}%</td></tr>`).join('') + '</table><br>';
+  }
+  return h + v.advertencias.map(w => `<div class="warn">⚠ ${esc(w)}</div>`).join('');
+}
 const dias = x => (x === null || x === undefined) ? 'N/D' : x + ' d';
 const de5 = f => f.partidos ? `${f.over25_ult5}/${Math.min(5, f.partidos)}` : 'N/D';
 
@@ -822,12 +1075,43 @@ async function analizar(lid, vid, mid) {
     html += `<div class="card"><h3>Jugadores clave (DFS)</h3><div class="dfs">${dfsCard('Local', d.dfs_local)}${dfsCard('Visitante', d.dfs_visita)}</div></div>`;
     html += '<div class="card">' + d.advertencias.map(w => `<div class="warn">⚠ ${esc(w)}</div>`).join('') + '</div>';
     out.innerHTML = html;
+    const lig = $('liga').value;
+    const box = document.createElement('div');
+    box.className = 'card';
+    const conApi = oddsOk && ['PL', 'PD', 'BL1', 'CL', 'SA'].includes(lig);
+    const campo = (id, et) => `<div><label>${et}</label><input id="q_${id}" inputmode="decimal" placeholder="2.10 o +110"></div>`;
+    box.innerHTML = `<h3>Valor frente al mercado</h3>
+      <div class="muted" style="margin-bottom:8px">Escribe las cuotas de tu casa (decimal 2.10 o americano +110 / -120). Deja vacío lo que no uses.</div>
+      <div class="cuotas">${campo('l', 'Local')}${campo('e', 'Empate')}${campo('v', 'Visitante')}
+        ${campo('o', 'Más de 2.5')}${campo('u', 'Menos de 2.5')}<div></div>${campo('bs', 'Ambos anotan: Sí')}${campo('bn', 'Ambos anotan: No')}</div>
+      <button class="btn" id="btnManual" style="margin-top:10px">Calcular valor</button><div id="valorManual"></div>` +
+      (conApi ? `<hr style="border:0;border-top:1px solid #233154;margin:16px 0"><button class="btn" id="btnValor">O traer cuotas automáticas (The Odds API)</button>
+        <div class="muted" style="margin-top:6px">Consume créditos (unos 2–3 la primera vez; se guardan 12 h).</div><div id="valorOut"></div>` : '');
+    out.appendChild(box);
+    $('btnManual').addEventListener('click', () => {
+      const c = {};
+      ['l', 'e', 'v', 'o', 'u', 'bs', 'bn'].forEach(k => { c[k] = aDecimal($('q_' + k).value); });
+      $('valorManual').innerHTML = valorManual(d, c);
+    });
+    if (conApi) {
+      $('btnValor').addEventListener('click', async () => {
+        const b = $('btnValor'), vo = $('valorOut');
+        b.disabled = true;
+        vo.innerHTML = '<p class="muted">Consultando cuotas…</p>';
+        try {
+          const v = await api(`/api/valor?liga=${lig}&local_id=${local}&visita_id=${visita}` + (partidoId ? `&partido_id=${partidoId}` : ''));
+          vo.innerHTML = pintarValor(v);
+        } catch (e) { vo.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+        finally { b.disabled = false; }
+      });
+    }
     out.scrollIntoView({behavior: 'smooth'});
   } catch (e) {
     out.innerHTML = `<p class="err">${esc(e.message)}</p>`;
   } finally { $('btn').disabled = false; }
 }
 
+fetch('/api/health').then(r => r.json()).then(h => { oddsOk = !!h.odds_key_configurada; }).catch(() => {});
 $('liga').addEventListener('change', cambioLiga);
 $('btn').addEventListener('click', () => analizar());
 cargarLigas().catch(e => { $('cartelera').innerHTML = `<span class="err">${esc(e.message)}</span>`; });
