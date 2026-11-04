@@ -1,8 +1,8 @@
-"""Panel Estadístico Draftea Pro v2 — un solo archivo.
+"""Panel Estadístico Draftea Pro v3 — versión football-data.org (un solo archivo).
 
 Requisitos (requirements.txt): fastapi, uvicorn[standard], httpx
-Variable de entorno en Render: API_FOOTBALL_KEY
-Start command en Render:      uvicorn main:app --host 0.0.0.0 --port $PORT
+Variable de entorno en Render: FOOTBALL_DATA_KEY
+Start command en Render:       uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 import asyncio
 import logging
@@ -10,8 +10,9 @@ import os
 import re
 import time
 import unicodedata
-from datetime import date, timedelta
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
 from math import exp, factorial
 from typing import Annotated, Any, Awaitable, Callable
 
@@ -27,31 +28,115 @@ logging.basicConfig(level=logging.INFO)
 # 1. CONFIGURACIÓN
 # =====================================================================
 API_KEY = next(
-    (os.getenv(k) for k in ("API_FOOTBALL_KEY", "API_KEY", "APIFOOTBALL_KEY", "X_APISPORTS_KEY") if os.getenv(k)),
+    (os.getenv(k) for k in ("FOOTBALL_DATA_KEY", "FOOTBALL_DATA_API_KEY", "API_KEY") if os.getenv(k)),
     None,
 )
-API_BASE = os.getenv("API_FOOTBALL_BASE", "https://v3.football.api-sports.io")
-MAX_CONCURRENTES = int(os.getenv("MAX_CONCURRENTES", "4"))
+API_BASE = os.getenv("API_BASE", "https://api.football-data.org/v4")
+RATE_POR_MIN = int(os.getenv("RATE_POR_MIN", "9"))  # el plan gratuito permite 10/min
+MAX_ESPERA_SEG = 25
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
-TTL_CARTELERA = 3600      # 1 h
-TTL_EQUIPOS = 86400       # 24 h
-TTL_HISTORIAL = 21600     # 6 h
-TTL_ESTADISTICAS = 43200  # 12 h
+TTL_CARTELERA = 1800     # 30 min
+TTL_EQUIPOS = 86400      # 24 h
+TTL_PARTIDOS = 3600      # 1 h
+TTL_H2H = 21600          # 6 h
 
-LIGAS: dict[int, str] = {
-    262: "Liga MX (México)", 39: "Premier League (Inglaterra)", 140: "La Liga (España)",
-    135: "Serie A (Italia)", 78: "Bundesliga (Alemania)", 61: "Ligue 1 (Francia)",
-    253: "MLS (Estados Unidos)", 2: "Champions League", 3: "Europa League",
-    13: "Copa Libertadores", 71: "Brasileirão (Brasil)", 128: "Primera División (Argentina)",
-    94: "Primeira Liga (Portugal)", 88: "Eredivisie (Países Bajos)", 1: "Mundial (FIFA)",
-    9: "Copa América", 4: "Eurocopa",
+# Competiciones incluidas en el plan gratuito de football-data.org
+LIGAS: dict[str, str] = {
+    "PL": "Premier League (Inglaterra)",
+    "PD": "La Liga (España)",
+    "SA": "Serie A (Italia)",
+    "BL1": "Bundesliga (Alemania)",
+    "FL1": "Ligue 1 (Francia)",
+    "CL": "Champions League",
+    "PPL": "Primeira Liga (Portugal)",
+    "DED": "Eredivisie (Países Bajos)",
+    "BSA": "Brasileirão (Brasil)",
+    "ELC": "Championship (Inglaterra)",
+    "EC": "Eurocopa",
+    "WC": "Mundial (FIFA)",
 }
+
+
+# =====================================================================
+# 3. MODELOS DE RESPUESTA
+# =====================================================================
+class EquipoRef(BaseModel):
+    id: int
+    nombre: str
+    logo: str | None = None
+
+
+class Equipo(EquipoRef):
+    tiene_dfs: bool = False
+
+
+class Partido(BaseModel):
+    fixture_id: int
+    fecha: str
+    ronda: str | None = None
+    estadio: str | None = None
+    local: Equipo
+    visita: Equipo
+
+
+class Forma(BaseModel):
+    partidos: int = 0
+    ganados: int = 0
+    empatados: int = 0
+    perdidos: int = 0
+    gf_prom: float | None = None
+    gc_prom: float | None = None
+    btts_pct: float | None = None
+    over15_pct: float | None = None
+    over25_pct: float | None = None
+    racha: str = ""  # más reciente primero
+
+
+class Marcador(BaseModel):
+    marcador: str
+    prob: float
+
+
+class Probabilidades(BaseModel):
+    local: float
+    empate: float
+    visita: float
+    over15: float
+    over25: float
+    over35: float
+    btts: float
+    goles_esperados_local: float
+    goles_esperados_visita: float
+    marcadores_probables: list[Marcador]
+
+
+class Dfs(BaseModel):
+    figura: str
+    puntos_esperados: float | None = None
+    xg: float | None = None
+    xa: float | None = None
+    tiros: float | None = None
+    tiros_arco: float | None = None
+    fuente: str = "manual"
+
+
+class Analisis(BaseModel):
+    local: EquipoRef
+    visita: EquipoRef
+    h2h: Forma
+    forma_local: Forma
+    forma_visita: Forma
+    probabilidades: Probabilidades | None = None
+    dfs_local: Dfs | None = None
+    dfs_visita: Dfs | None = None
+    advertencias: list[str] = []
+
 
 # =====================================================================
 # 2. PROYECCIONES DFS (manuales). Cada equipo una sola vez.
-#    (nombre, query de la API, figura, pts, xG, tiros, tiros al arco, xA)
 # =====================================================================
+#    (nombre, query, figura, pts, xG, tiros, tiros al arco, xA)
 _DFS_RAW = [
     # Liga MX
     ("Club América", "Club America", "Henry Martín (DEL)", "18.5", "0.65", "3.4", "1.8", "0.30"),
@@ -123,8 +208,13 @@ _DFS_RAW = [
     ("Alemania", "Germany", "Jamal Musiala (MED)", "18.8", "0.45", "2.7", "1.2", "0.40"),
 ]
 
-# Nombres que la API escribe distinto a tus llaves (ya normalizados con clave())
-_ALIAS_API = {"bayern munchen": "Bayern Munich"}
+# Nombres de football-data.org que no coinciden con tus llaves (ya normalizados con clave())
+_ALIAS_API = {
+    "bayern munchen": "Bayern Munich",
+    "04 bayer leverkusen": "Bayer Leverkusen",
+    "internazionale milano": "Inter",
+    "psv": "PSV Eindhoven",
+}
 _STOP = {"fc", "cf", "cd", "club", "de"}
 
 
@@ -146,110 +236,23 @@ for _k, _v in _ALIAS_API.items():
         _INDICE_DFS.setdefault(_k, _INDICE_DFS[clave(_v)])
 
 
-# =====================================================================
-# 3. MODELOS DE RESPUESTA
-# =====================================================================
-class EquipoRef(BaseModel):
-    id: int
-    nombre: str
-    logo: str | None = None
-
-
-class Equipo(EquipoRef):
-    tiene_dfs: bool = False
-
-
-class Partido(BaseModel):
-    fixture_id: int
-    fecha: str
-    ronda: str | None = None
-    estadio: str | None = None
-    local: Equipo
-    visita: Equipo
-
-
-class Forma(BaseModel):
-    partidos: int = 0
-    ganados: int = 0
-    empatados: int = 0
-    perdidos: int = 0
-    gf_prom: float | None = None
-    gc_prom: float | None = None
-    btts_pct: float | None = None
-    over15_pct: float | None = None
-    over25_pct: float | None = None
-    racha: str = ""  # más reciente primero
-
-
-class Detalle(BaseModel):
-    partidos: int = 0
-    tiros: float | None = None
-    tiros_arco: float | None = None
-    corners: float | None = None
-    faltas: float | None = None
-    amarillas: float | None = None
-    rojas: float | None = None
-
-
-class Marcador(BaseModel):
-    marcador: str
-    prob: float
-
-
-class Probabilidades(BaseModel):
-    local: float
-    empate: float
-    visita: float
-    over15: float
-    over25: float
-    over35: float
-    btts: float
-    goles_esperados_local: float
-    goles_esperados_visita: float
-    marcadores_probables: list[Marcador]
-
-
-class Dfs(BaseModel):
-    figura: str
-    puntos_esperados: float | None = None
-    xg: float | None = None
-    xa: float | None = None
-    tiros: float | None = None
-    tiros_arco: float | None = None
-    fuente: str = "manual"
-
-
-class Analisis(BaseModel):
-    local: EquipoRef
-    visita: EquipoRef
-    h2h: Forma
-    forma_local: Forma
-    forma_visita: Forma
-    detalle_local: Detalle | None = None
-    detalle_visita: Detalle | None = None
-    probabilidades: Probabilidades | None = None
-    dfs_local: Dfs | None = None
-    dfs_visita: Dfs | None = None
-    advertencias: list[str] = []
-
-
-def buscar_dfs(nombre: str) -> Dfs | None:
-    cfg = _INDICE_DFS.get(clave(nombre))
-    if not cfg:
-        return None
-
-    def f(x):
-        try:
-            return float(x)
-        except (TypeError, ValueError):
-            return None
-
-    return Dfs(figura=cfg["figura"], puntos_esperados=f(cfg["pts"]), xg=f(cfg["xg"]),
-               xa=f(cfg["xa"]), tiros=f(cfg["tiros"]), tiros_arco=f(cfg["tiros_arco"]))
+def buscar_dfs(*nombres: str | None) -> Dfs | None:
+    """Busca por nombre completo, nombre corto, etc. (el primero que coincida)."""
+    for n in nombres:
+        cfg = _INDICE_DFS.get(clave(n)) if n else None
+        if cfg:
+            def f(x):
+                try:
+                    return float(x)
+                except (TypeError, ValueError):
+                    return None
+            return Dfs(figura=cfg["figura"], puntos_esperados=f(cfg["pts"]), xg=f(cfg["xg"]),
+                       xa=f(cfg["xa"]), tiros=f(cfg["tiros"]), tiros_arco=f(cfg["tiros_arco"]))
+    return None
 
 
 # =====================================================================
-# 4. CACHÉ + CLIENTE API-FOOTBALL
+# 4. CACHÉ + CLIENTE football-data.org
 # =====================================================================
 class TTLCache:
     """Caché en memoria con TTL; junta llamadas simultáneas idénticas en una sola."""
@@ -285,80 +288,113 @@ class TTLCache:
             return valor
 
 
-class ApiFootballError(Exception):
+
+class ApiError(Exception):
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail
         super().__init__(detail)
 
 
-class ApiFootball:
+class _Limitador:
+    """Ventana deslizante de 60 s para respetar el límite del plan gratuito."""
+
+    def __init__(self, max_por_min: int):
+        self.max = max_por_min
+        self.marcas: deque[float] = deque()
+        self.lock = asyncio.Lock()
+
+    async def esperar(self) -> None:
+        async with self.lock:
+            while True:
+                ahora = time.monotonic()
+                while self.marcas and ahora - self.marcas[0] >= 60:
+                    self.marcas.popleft()
+                if len(self.marcas) < self.max:
+                    self.marcas.append(ahora)
+                    return
+                espera = 60 - (ahora - self.marcas[0])
+                if espera > MAX_ESPERA_SEG:
+                    raise ApiError(429, "Límite de peticiones por minuto del plan gratuito. Intenta de nuevo en unos segundos.")
+                await asyncio.sleep(espera + 0.1)
+
+
+class FootballData:
     def __init__(self):
         self.cache = TTLCache()
-        self._sem = asyncio.Semaphore(MAX_CONCURRENTES)
-        if "rapidapi" in API_BASE:
-            headers = {"x-rapidapi-key": API_KEY or "", "x-rapidapi-host": API_BASE.split("//")[-1].split("/")[0]}
-        else:
-            headers = {"x-apisports-key": API_KEY or ""}
-        self._http = httpx.AsyncClient(base_url=API_BASE, headers=headers, timeout=httpx.Timeout(10.0))
+        self._lim = _Limitador(RATE_POR_MIN)
+        self._http = httpx.AsyncClient(base_url=API_BASE, headers={"X-Auth-Token": API_KEY or ""},
+                                       timeout=httpx.Timeout(15.0))
 
     async def cerrar(self) -> None:
         await self._http.aclose()
 
-    async def _get(self, path: str, params: dict[str, Any], ttl: int) -> list[dict]:
+    async def _get(self, path: str, params: dict[str, Any], ttl: int) -> dict:
         if not API_KEY:
-            raise ApiFootballError(500, "Falta la variable de entorno API_FOOTBALL_KEY en el servidor.")
+            raise ApiError(500, "Falta la variable de entorno FOOTBALL_DATA_KEY en el servidor.")
         key = (path, tuple(sorted(params.items())))
 
-        async def fetch() -> list[dict]:
+        async def fetch() -> dict:
+            await self._lim.esperar()
             try:
-                async with self._sem:
-                    r = await self._http.get(path, params=params)
-                r.raise_for_status()
-                body = r.json()
+                r = await self._http.get(path, params=params)
             except httpx.HTTPError as e:
-                raise ApiFootballError(502, f"Error al consultar API-Football: {e}") from e
-            errores = body.get("errors")
-            if errores:  # la API manda {} o [] cuando no hay errores
-                if isinstance(errores, dict) and ("plan" in errores or "access" in errores):
-                    raise ApiFootballError(402, f"Tu plan de API-Football no permite esta consulta: {errores}")
-                raise ApiFootballError(502, f"API-Football: {errores}")
-            return body.get("response", [])
+                raise ApiError(502, f"No se pudo conectar con football-data.org: {e}") from e
+            if r.status_code >= 400:
+                try:
+                    msg = r.json().get("message", "")
+                except Exception:
+                    msg = ""
+                if r.status_code == 429:
+                    raise ApiError(429, "Límite de peticiones por minuto de football-data.org. Intenta de nuevo en unos segundos.")
+                if r.status_code in (401, 403):
+                    raise ApiError(r.status_code, f"football-data.org: {msg or 'acceso denegado (revisa la key o tu plan)'}")
+                if r.status_code == 404:
+                    raise ApiError(404, f"football-data.org: {msg or 'no encontrado'}")
+                raise ApiError(502, f"football-data.org respondió {r.status_code}: {msg}")
+            return r.json()
 
         return await self.cache.get_or_set(key, ttl, fetch)
 
-    async def temporada_actual(self, liga_id: int) -> int:
-        r = await self._get("/leagues", {"id": liga_id, "current": "true"}, TTL_EQUIPOS)
-        if not r or not r[0].get("seasons"):
-            raise ApiFootballError(404, f"Sin temporada actual para la liga {liga_id}")
-        return r[0]["seasons"][0]["year"]
+    async def equipos_liga(self, codigo: str) -> list[dict]:
+        return (await self._get(f"/competitions/{codigo}/teams", {}, TTL_EQUIPOS)).get("teams", [])
 
-    async def equipos_liga(self, liga_id: int, temporada: int) -> list[dict]:
-        r = await self._get("/teams", {"league": liga_id, "season": temporada}, TTL_EQUIPOS)
-        return [x["team"] for x in r]
+    async def proximos(self, codigo: str, dias: int = 9) -> list[dict]:
+        hoy = date.today()
+        params = {"dateFrom": hoy.isoformat(), "dateTo": (hoy + timedelta(days=dias)).isoformat()}
+        return (await self._get(f"/competitions/{codigo}/matches", params, TTL_CARTELERA)).get("matches", [])
+
+    async def partidos_equipo(self, team_id: int) -> list[dict]:
+        return (await self._get(f"/teams/{team_id}/matches", {"status": "FINISHED"}, TTL_PARTIDOS)).get("matches", [])
 
     async def equipo(self, team_id: int) -> dict:
-        r = await self._get("/teams", {"id": team_id}, TTL_EQUIPOS)
-        if not r:
-            raise ApiFootballError(404, f"Equipo {team_id} no encontrado")
-        return r[0]["team"]
+        return await self._get(f"/teams/{team_id}", {}, TTL_EQUIPOS)
 
-    # Sin los parámetros next/last (no existen en el plan gratuito):
-    # se pide por rango de fechas / temporada y se recorta localmente.
-    async def proximos(self, liga_id: int, temporada: int, dias: int = 30) -> list[dict]:
-        hoy = date.today()
-        params = {"league": liga_id, "season": temporada,
-                  "from": hoy.isoformat(), "to": (hoy + timedelta(days=dias)).isoformat()}
-        return await self._get("/fixtures", params, TTL_CARTELERA)
+    async def h2h(self, partido_id: int) -> list[dict]:
+        return (await self._get(f"/matches/{partido_id}/head2head", {"limit": 10}, TTL_H2H)).get("matches", [])
 
-    async def ultimos(self, team_id: int, temporada: int) -> list[dict]:
-        return await self._get("/fixtures", {"team": team_id, "season": temporada}, TTL_HISTORIAL)
 
-    async def h2h(self, a: int, b: int) -> list[dict]:
-        return await self._get("/fixtures/headtohead", {"h2h": f"{a}-{b}"}, TTL_HISTORIAL)
+def _norm(m: dict) -> dict:
+    """Convierte un partido de football-data.org al formato interno que usan las estadísticas."""
+    ft = (m.get("score") or {}).get("fullTime") or {}
+    try:
+        ts = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError):
+        ts = 0.0
+    estado = "FT" if m.get("status") == "FINISHED" else m.get("status", "")
+    return {
+        "fixture": {"id": m["id"], "timestamp": ts, "status": {"short": estado}},
+        "teams": {"home": {"id": m["homeTeam"]["id"]}, "away": {"id": m["awayTeam"]["id"]}},
+        "goals": {"home": ft.get("home"), "away": ft.get("away")},
+    }
 
-    async def stats_partido(self, fixture_id: int) -> list[dict]:
-        return await self._get("/fixtures/statistics", {"fixture": fixture_id}, TTL_ESTADISTICAS)
+
+def _equipo_en(partidos: list[dict], team_id: int) -> dict | None:
+    for m in partidos:
+        for lado in ("homeTeam", "awayTeam"):
+            if m.get(lado, {}).get("id") == team_id:
+                return m[lado]
+    return None
 
 
 # =====================================================================
@@ -437,81 +473,41 @@ def calcular_probabilidades(fl: Forma, fv: Forma, max_g: int = 10) -> Probabilid
     )
 
 
-_MAPA_STATS = {"Total Shots": "tiros", "Shots on Goal": "tiros_arco", "Corner Kicks": "corners",
-               "Fouls": "faltas", "Yellow Cards": "amarillas", "Red Cards": "rojas"}
-_CERO_SI_NULO = {"amarillas", "rojas"}
-
-
-def _num(v):
-    try:
-        return float(str(v).strip("%"))
-    except (TypeError, ValueError):
-        return None
-
-
-async def detalle_equipo(api: ApiFootball, team_id: int, fixtures: list[dict], n: int = 5) -> Detalle:
-    recientes = sorted((f for f in fixtures if _terminado(f)),
-                       key=lambda f: f["fixture"]["timestamp"], reverse=True)[:n]
-    respuestas = await asyncio.gather(*(api.stats_partido(f["fixture"]["id"]) for f in recientes),
-                                      return_exceptions=True)
-    acum: dict[str, list[float]] = {v: [] for v in _MAPA_STATS.values()}
-    usados = 0
-    for r in respuestas:
-        if isinstance(r, Exception):
-            continue
-        bloque = next((b for b in r if b["team"]["id"] == team_id), None)
-        if not bloque:
-            continue
-        usados += 1
-        for st in bloque["statistics"]:
-            campo = _MAPA_STATS.get(st["type"])
-            if not campo:
-                continue
-            val = _num(st["value"])
-            if val is None and campo in _CERO_SI_NULO:
-                val = 0.0
-            if val is not None:
-                acum[campo].append(val)
-    return Detalle(partidos=usados,
-                   **{k: (round(sum(v) / len(v), 1) if v else None) for k, v in acum.items()})
-
 
 # =====================================================================
 # 6. APP Y RUTAS
 # =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.api = ApiFootball()
+    app.state.api = FootballData()
     if not API_KEY:
-        logging.warning("API_FOOTBALL_KEY no está configurada")
+        logging.warning("FOOTBALL_DATA_KEY no está configurada")
     yield
     await app.state.api.cerrar()
 
 
-app = FastAPI(title="Panel Estadístico Draftea Pro", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Panel Estadístico Draftea Pro", version="3.0", lifespan=lifespan)
 
-if CORS_ORIGINS:  # solo si el front vive en otro dominio
+if CORS_ORIGINS:
     app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET"], allow_headers=["*"])
 
 
-def get_api(request: Request) -> ApiFootball:
+def get_api(request: Request) -> FootballData:
     return request.app.state.api
 
 
-Api = Annotated[ApiFootball, Depends(get_api)]
+Api = Annotated[FootballData, Depends(get_api)]
 
 
-@app.exception_handler(ApiFootballError)
-async def _api_error(_: Request, exc: ApiFootballError):
+@app.exception_handler(ApiError)
+async def _api_error(_: Request, exc: ApiError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-def _ref(t: dict) -> EquipoRef:
-    return EquipoRef(id=t["id"], nombre=t["name"], logo=t.get("logo"))
-
-
 def _equipo(t: dict) -> Equipo:
-    return Equipo(id=t["id"], nombre=t["name"], logo=t.get("logo"), tiene_dfs=buscar_dfs(t["name"]) is not None)
+    nombre = t.get("name") or t.get("shortName") or "?"
+    return Equipo(id=t["id"], nombre=nombre, logo=t.get("crest"),
+                  tiene_dfs=buscar_dfs(t.get("name"), t.get("shortName")) is not None)
 
 
 @app.get("/api/health")
@@ -521,53 +517,60 @@ async def health():
 
 @app.get("/api/ligas")
 async def ligas():
-    return [{"id": i, "nombre": n} for i, n in LIGAS.items()]
+    return [{"id": c, "nombre": n} for c, n in LIGAS.items()]
 
 
-@app.get("/api/ligas/{liga_id}/equipos", response_model=list[Equipo])
-async def equipos(liga_id: int, api: Api):
-    if liga_id not in LIGAS:
+@app.get("/api/ligas/{liga}/equipos", response_model=list[Equipo])
+async def equipos(liga: str, api: Api):
+    if liga not in LIGAS:
         raise HTTPException(404, "Liga no soportada")
-    temporada = await api.temporada_actual(liga_id)
-    return [_equipo(t) for t in await api.equipos_liga(liga_id, temporada)]
+    return [_equipo(t) for t in await api.equipos_liga(liga)]
 
 
-@app.get("/api/ligas/{liga_id}/proximos", response_model=list[Partido])
-async def proximos(liga_id: int, api: Api, n: Annotated[int, Query(ge=1, le=30)] = 10):
-    if liga_id not in LIGAS:
+@app.get("/api/ligas/{liga}/proximos", response_model=list[Partido])
+async def proximos(liga: str, api: Api, n: Annotated[int, Query(ge=1, le=30)] = 10):
+    if liga not in LIGAS:
         raise HTTPException(404, "Liga no soportada")
-    temporada = await api.temporada_actual(liga_id)
-    items = sorted(await api.proximos(liga_id, temporada), key=lambda i: i["fixture"]["timestamp"])[:n]
-    return [Partido(fixture_id=i["fixture"]["id"], fecha=i["fixture"]["date"],
-                    ronda=i["league"].get("round"), estadio=(i["fixture"].get("venue") or {}).get("name"),
-                    local=_equipo(i["teams"]["home"]), visita=_equipo(i["teams"]["away"]))
-            for i in items]
+    pendientes = [m for m in await api.proximos(liga) if m.get("status") in ("SCHEDULED", "TIMED")]
+    pendientes.sort(key=lambda m: m["utcDate"])
+    return [Partido(fixture_id=m["id"], fecha=m["utcDate"],
+                    ronda=f"Jornada {m['matchday']}" if m.get("matchday") else None,
+                    local=_equipo(m["homeTeam"]), visita=_equipo(m["awayTeam"]))
+            for m in pendientes[:n]]
 
 
 @app.get("/api/analisis", response_model=Analisis)
-async def analisis(api: Api, local_id: int, visita_id: int, liga_id: int,
-                   detalle: Annotated[bool, Query(description="Incluye tiros/córners/faltas (más llamadas)")] = False):
+async def analisis(api: Api, local_id: int, visita_id: int,
+                   partido_id: Annotated[int | None, Query(description="ID de un partido de la cartelera (habilita el H2H)")] = None):
     if local_id == visita_id:
         raise HTTPException(422, "Elige dos equipos diferentes")
 
-    if liga_id not in LIGAS:
-        raise HTTPException(404, "Liga no soportada")
-    temporada = await api.temporada_actual(liga_id)
-    t_l, t_v, ult_l, ult_v, h2h = await asyncio.gather(
-        api.equipo(local_id), api.equipo(visita_id),
-        api.ultimos(local_id, temporada), api.ultimos(visita_id, temporada), api.h2h(local_id, visita_id))
+    ms_l, ms_v = await asyncio.gather(api.partidos_equipo(local_id), api.partidos_equipo(visita_id))
+    t_l = _equipo_en(ms_l, local_id)
+    if t_l is None:
+        t_l = await api.equipo(local_id)
+    t_v = _equipo_en(ms_v, visita_id)
+    if t_v is None:
+        t_v = await api.equipo(visita_id)
 
+    ult_l, ult_v = [_norm(m) for m in ms_l], [_norm(m) for m in ms_v]
     forma_l, forma_v = resumen_forma(ult_l, local_id), resumen_forma(ult_v, visita_id)
-    h2h_res = resumen_forma(h2h, local_id)
 
-    det_l = det_v = None
-    if detalle:
-        det_l, det_v = await asyncio.gather(detalle_equipo(api, local_id, ult_l),
-                                            detalle_equipo(api, visita_id, ult_v))
+    avisos: list[str] = []
+    if partido_id:
+        try:
+            h2h_partidos = [_norm(m) for m in await api.h2h(partido_id)]
+        except ApiError as e:
+            h2h_partidos = []
+            avisos.append(f"No se pudo obtener el H2H: {e.detail}")
+    else:
+        h2h_partidos = [p for p in ult_l if {p["teams"]["home"]["id"], p["teams"]["away"]["id"]} == {local_id, visita_id}]
+        avisos.append("H2H completo solo disponible al elegir un partido de la cartelera; aquí se usa solo la temporada actual.")
+    h2h_res = resumen_forma(h2h_partidos, local_id)
 
-    dfs_l, dfs_v = buscar_dfs(t_l["name"]), buscar_dfs(t_v["name"])
+    dfs_l = buscar_dfs(t_l.get("name"), t_l.get("shortName"))
+    dfs_v = buscar_dfs(t_v.get("name"), t_v.get("shortName"))
 
-    avisos = []
     if h2h_res.partidos < 3:
         avisos.append(f"H2H con solo {h2h_res.partidos} partido(s): no es una muestra confiable.")
     if min(forma_l.partidos, forma_v.partidos) < 5:
@@ -576,13 +579,15 @@ async def analisis(api: Api, local_id: int, visita_id: int, liga_id: int,
         avisos.append("Sin proyección DFS cargada para alguno de los equipos.")
     if dfs_l or dfs_v:
         avisos.append("Las proyecciones DFS son valores cargados a mano, no calculados en vivo.")
-    avisos.append("Las probabilidades son un modelo Poisson simple basado en goles recientes; no considera lesiones ni alineaciones.")
+    avisos.append("Este proveedor no incluye tiros, córners ni faltas. Las probabilidades son un modelo Poisson simple (goles recientes), sin lesiones ni alineaciones.")
 
-    return Analisis(local=_ref(t_l), visita=_ref(t_v), h2h=h2h_res,
-                    forma_local=forma_l, forma_visita=forma_v,
-                    detalle_local=det_l, detalle_visita=det_v,
-                    probabilidades=calcular_probabilidades(forma_l, forma_v),
-                    dfs_local=dfs_l, dfs_visita=dfs_v, advertencias=avisos)
+    nom = lambda t: t.get("name") or t.get("shortName") or "?"  # noqa: E731
+    return Analisis(
+        local=EquipoRef(id=local_id, nombre=nom(t_l), logo=t_l.get("crest")),
+        visita=EquipoRef(id=visita_id, nombre=nom(t_v), logo=t_v.get("crest")),
+        h2h=h2h_res, forma_local=forma_l, forma_visita=forma_v,
+        probabilidades=calcular_probabilidades(forma_l, forma_v),
+        dfs_local=dfs_l, dfs_visita=dfs_v, advertencias=avisos)
 
 
 # =====================================================================
@@ -635,12 +640,12 @@ td:last-child{text-align:right;font-weight:bold;width:25%}td:nth-child(2){text-a
 <div id="cartelera" class="carousel"></div>
 <div class="row"><div><label>Local</label><select id="local"></select></div>
 <div><label>Visitante</label><select id="visita"></select></div></div>
-<label class="check"><input type="checkbox" id="detalle"> Incluir tiros, córners y faltas reales (usa más llamadas a la API)</label>
 <button class="btn" id="btn">Analizar enfrentamiento</button>
 <div id="resultado"></div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
+let partidos = [];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nd = x => (x === null || x === undefined) ? 'N/D' : x;
 const pc = x => (x === null || x === undefined) ? 'N/D' : x + '%';
@@ -666,6 +671,7 @@ async function cambioLiga() {
   const id = $('liga').value;
   $('cartelera').innerHTML = '<span class="muted">Cargando…</span>';
   $('local').innerHTML = $('visita').innerHTML = '';
+  partidos = [];
   const [eq, pr] = await Promise.allSettled([api(`/api/ligas/${id}/equipos`), api(`/api/ligas/${id}/proximos?n=10`)]);
   if (eq.status === 'fulfilled') {
     const lista = eq.value.sort((a, b) => a.nombre.localeCompare(b.nombre));
@@ -675,6 +681,7 @@ async function cambioLiga() {
   if (pr.status === 'rejected') { c.innerHTML = `<span class="err">${esc(pr.reason.message)}</span>`; return; }
   if (!pr.value.length) { c.innerHTML = '<span class="muted">No hay partidos próximos.</span>'; return; }
   c.innerHTML = '';
+  partidos = pr.value;
   pr.value.forEach(p => {
     const d = document.createElement('div');
     d.className = 'match-card';
@@ -684,7 +691,7 @@ async function cambioLiga() {
       <div style="font-size:11px;font-weight:bold;line-height:1.4">${esc(p.local.nombre)}<br>${esc(p.visita.nombre)}</div>`;
     d.addEventListener('click', () => {
       $('local').value = p.local.id; $('visita').value = p.visita.id;
-      analizar(p.local.id, p.visita.id);
+      analizar(p.local.id, p.visita.id, p.fixture_id);
     });
     c.appendChild(d);
   });
@@ -696,14 +703,16 @@ const dfsCard = (rol, d) => !d ? `<div class="pl">${rol}<div class="n">Sin proye
   `<div class="pl">${rol}<div class="n">${esc(d.figura)}</div><div class="p">${nd(d.puntos_esperados)} pts esperados</div>
    <div style="margin-top:6px">xG: <b>${nd(d.xg)}</b> · xA: <b>${nd(d.xa)}</b><br>Tiros: <b>${nd(d.tiros)}</b> · Al arco: <b>${nd(d.tiros_arco)}</b></div></div>`;
 
-async function analizar(lid, vid) {
+async function analizar(lid, vid, mid) {
   const local = lid || $('local').value, visita = vid || $('visita').value, out = $('resultado');
+  const pm = partidos.find(p => String(p.local.id) === String(local) && String(p.visita.id) === String(visita));
+  const partidoId = mid || (pm ? pm.fixture_id : '');
   if (!local || !visita) { out.innerHTML = '<p class="err">Elige los equipos.</p>'; return; }
   if (local === visita) { out.innerHTML = '<p class="err">Elige dos equipos diferentes.</p>'; return; }
   $('btn').disabled = true;
   out.innerHTML = '<p class="muted">Analizando…</p>';
   try {
-    const d = await api(`/api/analisis?local_id=${local}&visita_id=${visita}&liga_id=${$('liga').value}&detalle=${$('detalle').checked}`);
+    const d = await api(`/api/analisis?local_id=${local}&visita_id=${visita}` + (partidoId ? `&partido_id=${partidoId}` : ''));
     const p = d.probabilidades, fl = d.forma_local, fv = d.forma_visita, h = d.h2h;
     let html = `<div class="card"><div class="head">
       <div class="side"><img src="${esc(d.local.logo)}">${esc(d.local.nombre)}</div><div class="vs">VS</div>
@@ -727,13 +736,6 @@ async function analizar(lid, vid) {
       ? filas([[nd(h.partidos), 'Partidos', nd(h.partidos)], [h.ganados, 'Victorias', h.perdidos], [h.empatados, 'Empates', h.empatados],
                [nd(h.gf_prom), 'Goles prom.', nd(h.gc_prom)], [pc(h.over25_pct), 'Over 2.5', pc(h.over25_pct)], [pc(h.btts_pct), 'Ambos anotan', pc(h.btts_pct)]])
       : '<span class="muted">Sin enfrentamientos recientes.</span>') + '</div>';
-    if (d.detalle_local && d.detalle_visita) {
-      const a = d.detalle_local, b = d.detalle_visita;
-      html += `<div class="card"><h3>Promedios reales (últimos ${Math.max(a.partidos, b.partidos)} con datos)</h3>` + filas([
-        [nd(a.tiros), 'Tiros totales', nd(b.tiros)], [nd(a.tiros_arco), 'Tiros al arco', nd(b.tiros_arco)],
-        [nd(a.corners), 'Córners', nd(b.corners)], [nd(a.faltas), 'Faltas', nd(b.faltas)],
-        [nd(a.amarillas), 'Amarillas', nd(b.amarillas)], [nd(a.rojas), 'Rojas', nd(b.rojas)]]) + '</div>';
-    }
     html += `<div class="card"><h3>Jugadores clave (DFS)</h3><div class="dfs">${dfsCard('Local', d.dfs_local)}${dfsCard('Visitante', d.dfs_visita)}</div></div>`;
     html += '<div class="card">' + d.advertencias.map(w => `<div class="warn">⚠ ${esc(w)}</div>`).join('') + '</div>';
     out.innerHTML = html;
@@ -747,6 +749,7 @@ $('liga').addEventListener('change', cambioLiga);
 $('btn').addEventListener('click', () => analizar());
 cargarLigas().catch(e => { $('cartelera').innerHTML = `<span class="err">${esc(e.message)}</span>`; });
 </script></body></html>"""
+
 
 
 @app.get("/", response_class=HTMLResponse)
