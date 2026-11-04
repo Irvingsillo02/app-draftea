@@ -87,9 +87,14 @@ class Forma(BaseModel):
     perdidos: int = 0
     gf_prom: float | None = None
     gc_prom: float | None = None
+    goles_totales_prom: float | None = None
     btts_pct: float | None = None
     over15_pct: float | None = None
     over25_pct: float | None = None
+    porteria_cero_pct: float | None = None  # % de partidos sin recibir gol
+    sin_anotar_pct: float | None = None     # % de partidos sin marcar
+    over25_ult5: int = 0                    # de sus últimos 5, cuántos pasaron de 2.5
+    btts_ult5: int = 0
     racha: str = ""  # más reciente primero
 
 
@@ -121,12 +126,22 @@ class Dfs(BaseModel):
     fuente: str = "manual"
 
 
+class Carga(BaseModel):
+    dias_descanso: float | None = None  # días desde su último partido hasta hoy
+    partidos_14d: int = 0
+    partidos_30d: int = 0
+
+
 class Analisis(BaseModel):
     local: EquipoRef
     visita: EquipoRef
     h2h: Forma
     forma_local: Forma
     forma_visita: Forma
+    forma_local_casa: Forma
+    forma_visita_fuera: Forma
+    carga_local: Carga
+    carga_visita: Carga
     probabilidades: Probabilidades | None = None
     dfs_local: Dfs | None = None
     dfs_visita: Dfs | None = None
@@ -417,9 +432,9 @@ def resumen_forma(fixtures: list[dict], team_id: int, n_max: int = 10) -> Forma:
     n = len(jugados)
     if n == 0:
         return Forma()
-    gf = gc = g = e = p = btts = o15 = o25 = 0
+    gf = gc = g = e = p = btts = o15 = o25 = cs = fts = o25_5 = btts_5 = 0
     racha = []
-    for f in jugados:
+    for idx, f in enumerate(jugados):
         es_local = f["teams"]["home"]["id"] == team_id
         a = f["goals"]["home" if es_local else "away"]
         b = f["goals"]["away" if es_local else "home"]
@@ -434,14 +449,35 @@ def resumen_forma(fixtures: list[dict], team_id: int, n_max: int = 10) -> Forma:
         else:
             p += 1
             racha.append("P")
-        btts += a > 0 and b > 0
+        ambos = a > 0 and b > 0
+        btts += ambos
         o15 += a + b > 1.5
         o25 += a + b > 2.5
+        cs += b == 0
+        fts += a == 0
+        if idx < 5:  # los 5 más recientes
+            o25_5 += a + b > 2.5
+            btts_5 += ambos
     pc = lambda x: round(100 * x / n, 1)  # noqa: E731
     return Forma(partidos=n, ganados=g, empatados=e, perdidos=p,
                  gf_prom=round(gf / n, 2), gc_prom=round(gc / n, 2),
+                 goles_totales_prom=round((gf + gc) / n, 2),
                  btts_pct=pc(btts), over15_pct=pc(o15), over25_pct=pc(o25),
-                 racha="".join(racha[:5]))
+                 porteria_cero_pct=pc(cs), sin_anotar_pct=pc(fts),
+                 over25_ult5=o25_5, btts_ult5=btts_5, racha="".join(racha[:5]))
+
+
+def calcular_carga(fixtures: list[dict], ahora: float | None = None) -> Carga:
+    """Días de descanso y partidos jugados en 14/30 días (solo competiciones del plan)."""
+    ahora = ahora or time.time()
+    ts = sorted((f["fixture"]["timestamp"] for f in fixtures
+                 if _terminado(f) and 0 < f["fixture"]["timestamp"] <= ahora), reverse=True)
+    if not ts:
+        return Carga()
+    dia = 86400
+    return Carga(dias_descanso=round((ahora - ts[0]) / dia, 1),
+                 partidos_14d=sum(1 for t in ts if ahora - t <= 14 * dia),
+                 partidos_30d=sum(1 for t in ts if ahora - t <= 30 * dia))
 
 
 def _pois(k: int, lam: float) -> float:
@@ -454,9 +490,27 @@ def _ajustar(prom: float | None, n: int) -> float:
     return (prom * n + PRIOR_GOLES * K_SHRINK) / (n + K_SHRINK)
 
 
-def calcular_probabilidades(fl: Forma, fv: Forma, max_g: int = 10) -> Probabilidades:
-    lam_l = (_ajustar(fl.gf_prom, fl.partidos) + _ajustar(fv.gc_prom, fv.partidos)) / 2 * FACTOR_LOCAL
-    lam_v = (_ajustar(fv.gf_prom, fv.partidos) + _ajustar(fl.gc_prom, fl.partidos)) / 2 * FACTOR_VISITA
+MIN_PARTIDOS_SEDE = 4  # mínimo de partidos en casa/de visita para usar ese rendimiento
+
+
+def _ataque_defensa(general: Forma, sede: Forma | None) -> tuple[float, float, bool]:
+    """Goles a favor/en contra esperados; mezcla 50/50 con el rendimiento por sede si hay muestra."""
+    gf = _ajustar(general.gf_prom, general.partidos)
+    gc = _ajustar(general.gc_prom, general.partidos)
+    usa_sede = sede is not None and sede.partidos >= MIN_PARTIDOS_SEDE
+    if usa_sede:
+        gf = 0.5 * gf + 0.5 * _ajustar(sede.gf_prom, sede.partidos)
+        gc = 0.5 * gc + 0.5 * _ajustar(sede.gc_prom, sede.partidos)
+    return gf, gc, usa_sede
+
+
+def calcular_probabilidades(fl: Forma, fv: Forma, fl_casa: Forma | None = None,
+                            fv_fuera: Forma | None = None, max_g: int = 10) -> Probabilidades:
+    gf_l, gc_l, sede_l = _ataque_defensa(fl, fl_casa)
+    gf_v, gc_v, sede_v = _ataque_defensa(fv, fv_fuera)
+    # si ya se usó el rendimiento por sede, la ventaja de localía va incluida; si no, factor fijo
+    lam_l = (gf_l + gc_v) / 2 * (1.0 if sede_l else FACTOR_LOCAL)
+    lam_v = (gf_v + gc_l) / 2 * (1.0 if sede_v else FACTOR_VISITA)
     celdas = [(i, j, _pois(i, lam_l) * _pois(j, lam_v)) for i in range(max_g) for j in range(max_g)]
     total = sum(c[2] for c in celdas)
 
@@ -555,6 +609,9 @@ async def analisis(api: Api, local_id: int, visita_id: int,
 
     ult_l, ult_v = [_norm(m) for m in ms_l], [_norm(m) for m in ms_v]
     forma_l, forma_v = resumen_forma(ult_l, local_id), resumen_forma(ult_v, visita_id)
+    casa_l = resumen_forma([p for p in ult_l if p["teams"]["home"]["id"] == local_id], local_id)
+    fuera_v = resumen_forma([p for p in ult_v if p["teams"]["away"]["id"] == visita_id], visita_id)
+    carga_l, carga_v = calcular_carga(ult_l), calcular_carga(ult_v)
 
     avisos: list[str] = []
     if partido_id:
@@ -582,11 +639,19 @@ async def analisis(api: Api, local_id: int, visita_id: int,
     avisos.append("Este proveedor no incluye tiros, córners ni faltas. Las probabilidades son un modelo Poisson simple (goles recientes), sin lesiones ni alineaciones.")
 
     nom = lambda t: t.get("name") or t.get("shortName") or "?"  # noqa: E731
+    for nombre, c in ((nom(t_l), carga_l), (nom(t_v), carga_v)):
+        if c.dias_descanso is not None and c.dias_descanso <= 3:
+            avisos.append(f"{nombre} jugó hace {c.dias_descanso} días: poca recuperación, posible rotación.")
+        if c.partidos_14d >= 4:
+            avisos.append(f"{nombre} acumula {c.partidos_14d} partidos en 14 días.")
+    avisos.append("Descanso y carga cuentan solo partidos de competiciones incluidas en el plan (no copas nacionales ni amistosos) y se miden a hoy.")
     return Analisis(
         local=EquipoRef(id=local_id, nombre=nom(t_l), logo=t_l.get("crest")),
         visita=EquipoRef(id=visita_id, nombre=nom(t_v), logo=t_v.get("crest")),
         h2h=h2h_res, forma_local=forma_l, forma_visita=forma_v,
-        probabilidades=calcular_probabilidades(forma_l, forma_v),
+        forma_local_casa=casa_l, forma_visita_fuera=fuera_v,
+        carga_local=carga_l, carga_visita=carga_v,
+        probabilidades=calcular_probabilidades(forma_l, forma_v, casa_l, fuera_v),
         dfs_local=dfs_l, dfs_visita=dfs_v, advertencias=avisos)
 
 
@@ -650,6 +715,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const nd = x => (x === null || x === undefined) ? 'N/D' : x;
 const pc = x => (x === null || x === undefined) ? 'N/D' : x + '%';
 const fr = x => Math.round(x * 100) + '%';
+const dias = x => (x === null || x === undefined) ? 'N/D' : x + ' d';
+const de5 = f => f.partidos ? `${f.over25_ult5}/${Math.min(5, f.partidos)}` : 'N/D';
 
 async function api(url) {
   const r = await fetch(url);
@@ -730,8 +797,24 @@ async function analizar(lid, vid, mid) {
       [nd(fl.partidos), 'Partidos', nd(fv.partidos)],
       [`${fl.ganados}-${fl.empatados}-${fl.perdidos}`, 'G-E-P', `${fv.ganados}-${fv.empatados}-${fv.perdidos}`],
       [nd(fl.gf_prom), 'Goles a favor', nd(fv.gf_prom)], [nd(fl.gc_prom), 'Goles en contra', nd(fv.gc_prom)],
-      [pc(fl.over25_pct), 'Over 2.5', pc(fv.over25_pct)], [pc(fl.btts_pct), 'Ambos anotan', pc(fv.btts_pct)],
+      [nd(fl.goles_totales_prom), 'Goles totales por partido', nd(fv.goles_totales_prom)],
+      [pc(fl.over25_pct), 'Over 2.5', pc(fv.over25_pct)], [de5(fl), 'Over 2.5 (últimos 5)', de5(fv)],
+      [pc(fl.btts_pct), 'Ambos anotan', pc(fv.btts_pct)],
+      [pc(fl.porteria_cero_pct), 'Portería en cero', pc(fv.porteria_cero_pct)],
+      [pc(fl.sin_anotar_pct), 'Sin anotar', pc(fv.sin_anotar_pct)],
       [racha(fl.racha), 'Racha', racha(fv.racha)]]) + '</div>';
+    const cs = d.forma_local_casa, fs = d.forma_visita_fuera, cl = d.carga_local, cv = d.carga_visita;
+    html += `<div class="card"><h3>Local en casa vs. visitante de visita</h3>` + ((cs.partidos || fs.partidos)
+      ? filas([[nd(cs.partidos), 'Partidos', nd(fs.partidos)],
+               [`${cs.ganados}-${cs.empatados}-${cs.perdidos}`, 'G-E-P', `${fs.ganados}-${fs.empatados}-${fs.perdidos}`],
+               [nd(cs.gf_prom), 'Goles a favor', nd(fs.gf_prom)], [nd(cs.gc_prom), 'Goles en contra', nd(fs.gc_prom)],
+               [pc(cs.over25_pct), 'Over 2.5', pc(fs.over25_pct)], [pc(cs.btts_pct), 'Ambos anotan', pc(fs.btts_pct)],
+               [pc(cs.porteria_cero_pct), 'Portería en cero', pc(fs.porteria_cero_pct)]])
+      : '<span class="muted">Sin partidos suficientes por sede.</span>') + '</div>';
+    html += `<div class="card"><h3>Descanso y carga de partidos</h3>` + filas([
+      [dias(cl.dias_descanso), 'Desde su último partido', dias(cv.dias_descanso)],
+      [nd(cl.partidos_14d), 'Partidos en 14 días', nd(cv.partidos_14d)],
+      [nd(cl.partidos_30d), 'Partidos en 30 días', nd(cv.partidos_30d)]]) + '</div>';
     html += `<div class="card"><h3>Historial directo (H2H)</h3>` + (h.partidos
       ? filas([[nd(h.partidos), 'Partidos', nd(h.partidos)], [h.ganados, 'Victorias', h.perdidos], [h.empatados, 'Empates', h.empatados],
                [nd(h.gf_prom), 'Goles prom.', nd(h.gc_prom)], [pc(h.over25_pct), 'Over 2.5', pc(h.over25_pct)], [pc(h.btts_pct), 'Ambos anotan', pc(h.btts_pct)]])
