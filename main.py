@@ -1,518 +1,741 @@
-import json
-from fastapi import FastAPI, Query
+"""Panel Estadístico Draftea Pro v2 — un solo archivo.
+
+Requisitos (requirements.txt): fastapi, uvicorn[standard], httpx
+Variable de entorno en Render: API_FOOTBALL_KEY
+Start command en Render:      uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
+import asyncio
+import logging
+import os
+import re
+import time
+import unicodedata
+from contextlib import asynccontextmanager
+from math import exp, factorial
+from typing import Annotated, Any, Awaitable, Callable
+
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-import api_futbol
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
-app = FastAPI(title="Estadisticas Irvingsillo")
+logging.basicConfig(level=logging.INFO)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# =====================================================================
+# 1. CONFIGURACIÓN
+# =====================================================================
+API_KEY = next(
+    (os.getenv(k) for k in ("API_FOOTBALL_KEY", "API_KEY", "APIFOOTBALL_KEY", "X_APISPORTS_KEY") if os.getenv(k)),
+    None,
 )
+API_BASE = os.getenv("API_FOOTBALL_BASE", "https://v3.football.api-sports.io")
+MAX_CONCURRENTES = int(os.getenv("MAX_CONCURRENTES", "4"))
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
-# Catálogo global unificado de IDs de API-Football
-LIGAS_API_IDS = {
-    "Liga MX (México)": 262,
-    "Premier League (Inglaterra)": 39,
-    "La Liga (España)": 140,
-    "Serie A (Italia)": 135,
-    "Bundesliga (Alemania)": 78,
-    "Ligue 1 (Francia)": 61,
-    "MLS (Estados Unidos)": 253,
-    "Champions League": 2,
-    "Europa League": 3,
-    "Copa Libertadores": 13,
-    "Brasileirão (Brasil)": 71,
-    "Primera División (Argentina)": 128,
-    "Primeira Liga (Portugal)": 94,
-    "Eredivisie (Países Bajos)": 88,
-    "Mundial (FIFA)": 1,
-    "Copa América": 9,
-    "Eurocopa": 4
+TTL_CARTELERA = 3600      # 1 h
+TTL_EQUIPOS = 86400       # 24 h
+TTL_HISTORIAL = 21600     # 6 h
+TTL_ESTADISTICAS = 43200  # 12 h
+
+LIGAS: dict[int, str] = {
+    262: "Liga MX (México)", 39: "Premier League (Inglaterra)", 140: "La Liga (España)",
+    135: "Serie A (Italia)", 78: "Bundesliga (Alemania)", 61: "Ligue 1 (Francia)",
+    253: "MLS (Estados Unidos)", 2: "Champions League", 3: "Europa League",
+    13: "Copa Libertadores", 71: "Brasileirão (Brasil)", 128: "Primera División (Argentina)",
+    94: "Primeira Liga (Portugal)", 88: "Eredivisie (Países Bajos)", 1: "Mundial (FIFA)",
+    9: "Copa América", 4: "Eurocopa",
 }
 
-# Base de datos global de equipos y proyecciones DFS
-LIGAS_CONFIG = {
-    "Liga MX (México)": {
-        "Club América": {"query": "Club America", "figura": "Henry Martín (DEL)", "pts": "18.5 pts", "xg": "0.65", "tiros": "3.4", "tiros_arco": "1.8", "xa": "0.30"},
-        "Cruz Azul": {"query": "Cruz Azul", "figura": "Ángel Sepúlveda (DEL)", "pts": "16.4 pts", "xg": "0.58", "tiros": "3.1", "tiros_arco": "1.5", "xa": "0.22"},
-        "Monterrey (Rayados)": {"query": "Monterrey", "figura": "Sergio Canales (MED)", "pts": "17.9 pts", "xg": "0.42", "tiros": "3.2", "tiros_arco": "1.4", "xa": "0.45"},
-        "Tigres UANL": {"query": "Tigres UANL", "figura": "A-P. Gignac (DEL)", "pts": "17.2 pts", "xg": "0.62", "tiros": "3.6", "tiros_arco": "1.7", "xa": "0.20"},
-        "Toluca": {"query": "Toluca", "figura": "Paulinho (DEL)", "pts": "18.1 pts", "xg": "0.68", "tiros": "3.5", "tiros_arco": "1.8", "xa": "0.22"},
-        "Pumas UNAM": {"query": "Pumas UNAM", "figura": "César Huerta (DEL)", "pts": "16.9 pts", "xg": "0.45", "tiros": "3.3", "tiros_arco": "1.4", "xa": "0.35"},
-        "Guadalajara (Chivas)": {"query": "Guadalajara Chivas", "figura": "Roberto Alvarado (MED)", "pts": "15.8 pts", "xg": "0.35", "tiros": "2.8", "tiros_arco": "1.2", "xa": "0.42"},
-        "Pachuca": {"query": "Pachuca", "figura": "Salomón Rondón (DEL)", "pts": "16.7 pts", "xg": "0.60", "tiros": "3.5", "tiros_arco": "1.6", "xa": "0.18"}
-    },
-    "Premier League (Inglaterra)": {
-        "Arsenal": {"query": "Arsenal", "figura": "Bukayo Saka (DEL)", "pts": "19.2 pts", "xg": "0.52", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.48"},
-        "Chelsea": {"query": "Chelsea", "figura": "Cole Palmer (MED)", "pts": "21.0 pts", "xg": "0.65", "tiros": "3.6", "tiros_arco": "1.8", "xa": "0.50"},
-        "Liverpool": {"query": "Liverpool", "figura": "Mohamed Salah (DEL)", "pts": "20.4 pts", "xg": "0.70", "tiros": "3.8", "tiros_arco": "1.9", "xa": "0.42"},
-        "Manchester City": {"query": "Manchester City", "figura": "Erling Haaland (DEL)", "pts": "22.5 pts", "xg": "0.95", "tiros": "4.2", "tiros_arco": "2.4", "xa": "0.12"},
-        "Manchester United": {"query": "Manchester United", "figura": "Bruno Fernandes (MED)", "pts": "16.8 pts", "xg": "0.35", "tiros": "2.8", "tiros_arco": "1.1", "xa": "0.45"},
-        "Tottenham": {"query": "Tottenham", "figura": "Son Heung-Min (DEL)", "pts": "18.5 pts", "xg": "0.48", "tiros": "3.1", "tiros_arco": "1.5", "xa": "0.35"}
-    },
-    "La Liga (España)": {
-        "Real Madrid": {"query": "Real Madrid", "figura": "Vinicius Jr (DEL)", "pts": "20.8 pts", "xg": "0.68", "tiros": "3.7", "tiros_arco": "1.8", "xa": "0.44"},
-        "FC Barcelona": {"query": "Barcelona", "figura": "Lamine Yamal (DEL)", "pts": "19.5 pts", "xg": "0.48", "tiros": "3.3", "tiros_arco": "1.4", "xa": "0.52"},
-        "Atlético de Madrid": {"query": "Atletico Madrid", "figura": "Antoine Griezmann (DEL)", "pts": "17.2 pts", "xg": "0.45", "tiros": "2.8", "tiros_arco": "1.2", "xa": "0.38"},
-        "Athletic Club": {"query": "Athletic Club", "figura": "Iñaki Williams (DEL)", "pts": "14.5 pts", "xg": "0.38", "tiros": "2.5", "tiros_arco": "1.0", "xa": "0.22"},
-        "Real Sociedad": {"query": "Real Sociedad", "figura": "Takefusa Kubo (MED)", "pts": "13.8 pts", "xg": "0.30", "tiros": "2.2", "tiros_arco": "0.9", "xa": "0.28"}
-    },
-    "Serie A (Italia)": {
-        "Inter de Milán": {"query": "Inter", "figura": "Lautaro Martínez (DEL)", "pts": "18.2 pts", "xg": "0.60", "tiros": "3.5", "tiros_arco": "1.6", "xa": "0.15"},
-        "Juventus": {"query": "Juventus", "figura": "Dusan Vlahovic (DEL)", "pts": "16.5 pts", "xg": "0.55", "tiros": "3.1", "tiros_arco": "1.4", "xa": "0.10"},
-        "AC Milan": {"query": "AC Milan", "figura": "Christian Pulisic (MED)", "pts": "17.0 pts", "xg": "0.45", "tiros": "2.9", "tiros_arco": "1.2", "xa": "0.35"},
-        "Napoli": {"query": "Napoli", "figura": "Khvicha Kvaratskhelia (DEL)", "pts": "18.8 pts", "xg": "0.50", "tiros": "3.3", "tiros_arco": "1.5", "xa": "0.40"},
-        "AS Roma": {"query": "Roma", "figura": "Paulo Dybala (DEL)", "pts": "15.8 pts", "xg": "0.42", "tiros": "2.6", "tiros_arco": "1.1", "xa": "0.32"}
-    },
-    "Bundesliga (Alemania)": {
-        "Bayern Munich": {"query": "Bayern Munich", "figura": "Harry Kane (DEL)", "pts": "22.5 pts", "xg": "0.85", "tiros": "4.1", "tiros_arco": "2.2", "xa": "0.25"},
-        "Bayer Leverkusen": {"query": "Bayer Leverkusen", "figura": "Florian Wirtz (MED)", "pts": "19.0 pts", "xg": "0.40", "tiros": "2.5", "tiros_arco": "1.1", "xa": "0.55"},
-        "Borussia Dortmund": {"query": "Borussia Dortmund", "figura": "Julian Brandt (MED)", "pts": "15.5 pts", "xg": "0.25", "tiros": "1.8", "tiros_arco": "0.8", "xa": "0.45"},
-        "RB Leipzig": {"query": "RB Leipzig", "figura": "Xavi Simons (MED)", "pts": "16.2 pts", "xg": "0.32", "tiros": "2.4", "tiros_arco": "1.0", "xa": "0.42"}
-    },
-    "Ligue 1 (Francia)": {
-        "PSG": {"query": "Paris Saint Germain", "figura": "Bradley Barcola (DEL)", "pts": "19.5 pts", "xg": "0.55", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.30"},
-        "Mónaco": {"query": "Monaco", "figura": "Aleksandr Golovin (MED)", "pts": "14.8 pts", "xg": "0.20", "tiros": "1.9", "tiros_arco": "0.7", "xa": "0.40"},
-        "Marsella": {"query": "Marseille", "figura": "Mason Greenwood (DEL)", "pts": "17.2 pts", "xg": "0.48", "tiros": "2.8", "tiros_arco": "1.3", "xa": "0.25"}
-    },
-    "MLS (Estados Unidos)": {
-        "Inter Miami": {"query": "Inter Miami", "figura": "Lionel Messi (DEL)", "pts": "24.5 pts", "xg": "0.75", "tiros": "4.0", "tiros_arco": "2.0", "xa": "0.65"},
-        "LAFC": {"query": "Los Angeles FC", "figura": "Denis Bouanga (DEL)", "pts": "20.1 pts", "xg": "0.68", "tiros": "3.8", "tiros_arco": "1.7", "xa": "0.25"},
-        "LA Galaxy": {"query": "Los Angeles Galaxy", "figura": "Riqui Puig (MED)", "pts": "17.5 pts", "xg": "0.30", "tiros": "2.5", "tiros_arco": "1.0", "xa": "0.50"},
-        "Columbus Crew": {"query": "Columbus Crew", "figura": "Cucho Hernández (DEL)", "pts": "19.0 pts", "xg": "0.62", "tiros": "3.5", "tiros_arco": "1.6", "xa": "0.30"}
-    },
-    "Brasileirão (Brasil)": {
-        "Flamengo": {"query": "Flamengo", "figura": "Pedro (DEL)", "pts": "17.8 pts", "xg": "0.60", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.15"},
-        "Palmeiras": {"query": "Palmeiras", "figura": "Raphael Veiga (MED)", "pts": "16.5 pts", "xg": "0.35", "tiros": "2.4", "tiros_arco": "1.0", "xa": "0.40"},
-        "Botafogo": {"query": "Botafogo", "figura": "Tiquinho Soares (DEL)", "pts": "15.2 pts", "xg": "0.45", "tiros": "2.7", "tiros_arco": "1.2", "xa": "0.20"}
-    },
-    "Primera División (Argentina)": {
-        "River Plate": {"query": "River Plate", "figura": "Miguel Borja (DEL)", "pts": "18.0 pts", "xg": "0.62", "tiros": "3.3", "tiros_arco": "1.6", "xa": "0.10"},
-        "Boca Juniors": {"query": "Boca Juniors", "figura": "Edinson Cavani (DEL)", "pts": "16.5 pts", "xg": "0.50", "tiros": "2.9", "tiros_arco": "1.3", "xa": "0.15"},
-        "Racing Club": {"query": "Racing Club", "figura": "Adrián Martínez (DEL)", "pts": "15.8 pts", "xg": "0.48", "tiros": "2.8", "tiros_arco": "1.2", "xa": "0.12"}
-    },
-    "Primeira Liga (Portugal)": {
-        "Benfica": {"query": "Benfica", "figura": "Ángel Di María (MED)", "pts": "16.5 pts", "xg": "0.35", "tiros": "2.5", "tiros_arco": "1.0", "xa": "0.45"},
-        "FC Porto": {"query": "FC Porto", "figura": "Evanilson (DEL)", "pts": "15.8 pts", "xg": "0.50", "tiros": "2.8", "tiros_arco": "1.2", "xa": "0.15"},
-        "Sporting CP": {"query": "Sporting CP", "figura": "Viktor Gyökeres (DEL)", "pts": "21.0 pts", "xg": "0.75", "tiros": "4.0", "tiros_arco": "2.0", "xa": "0.25"}
-    },
-    "Eredivisie (Países Bajos)": {
-        "PSV Eindhoven": {"query": "PSV Eindhoven", "figura": "Luuk de Jong (DEL)", "pts": "18.5 pts", "xg": "0.65", "tiros": "3.5", "tiros_arco": "1.5", "xa": "0.20"},
-        "Feyenoord": {"query": "Feyenoord", "figura": "Santiago Giménez (DEL)", "pts": "17.0 pts", "xg": "0.58", "tiros": "3.2", "tiros_arco": "1.4", "xa": "0.15"},
-        "Ajax": {"query": "Ajax", "figura": "Brian Brobbey (DEL)", "pts": "15.5 pts", "xg": "0.50", "tiros": "2.9", "tiros_arco": "1.3", "xa": "0.18"}
-    },
-    "Champions League": {
-        "Real Madrid": {"query": "Real Madrid", "figura": "Vinicius Jr (DEL)", "pts": "20.8 pts", "xg": "0.68", "tiros": "3.7", "tiros_arco": "1.8", "xa": "0.44"},
-        "Manchester City": {"query": "Manchester City", "figura": "Erling Haaland (DEL)", "pts": "22.5 pts", "xg": "0.95", "tiros": "4.2", "tiros_arco": "2.4", "xa": "0.12"},
-        "Bayern Munich": {"query": "Bayern Munich", "figura": "Harry Kane (DEL)", "pts": "22.5 pts", "xg": "0.85", "tiros": "4.1", "tiros_arco": "2.2", "xa": "0.25"},
-        "PSG": {"query": "Paris Saint Germain", "figura": "Kylian Mbappé (DEL)", "pts": "23.0 pts", "xg": "0.88", "tiros": "4.5", "tiros_arco": "2.3", "xa": "0.35"}
-    },
-    "Europa League": {
-        "Liverpool": {"query": "Liverpool", "figura": "Mohamed Salah (DEL)", "pts": "20.4 pts", "xg": "0.70", "tiros": "3.8", "tiros_arco": "1.9", "xa": "0.42"},
-        "Bayer Leverkusen": {"query": "Bayer Leverkusen", "figura": "Florian Wirtz (MED)", "pts": "19.0 pts", "xg": "0.40", "tiros": "2.5", "tiros_arco": "1.1", "xa": "0.55"},
-        "AS Roma": {"query": "Roma", "figura": "Romelu Lukaku (DEL)", "pts": "16.0 pts", "xg": "0.52", "tiros": "2.7", "tiros_arco": "1.2", "xa": "0.18"}
-    },
-    "Copa Libertadores": {
-        "Fluminense": {"query": "Fluminense", "figura": "Germán Cano (DEL)", "pts": "17.5 pts", "xg": "0.65", "tiros": "3.4", "tiros_arco": "1.5", "xa": "0.10"},
-        "Boca Juniors": {"query": "Boca Juniors", "figura": "Edinson Cavani (DEL)", "pts": "16.5 pts", "xg": "0.50", "tiros": "2.9", "tiros_arco": "1.3", "xa": "0.15"},
-        "River Plate": {"query": "River Plate", "figura": "Miguel Borja (DEL)", "pts": "18.0 pts", "xg": "0.62", "tiros": "3.3", "tiros_arco": "1.6", "xa": "0.10"},
-        "Palmeiras": {"query": "Palmeiras", "figura": "Endrick (DEL)", "pts": "15.0 pts", "xg": "0.40", "tiros": "2.5", "tiros_arco": "1.1", "xa": "0.15"}
-    },
-    "Mundial (FIFA)": {
-        "Argentina": {"query": "Argentina", "figura": "Lionel Messi (DEL)", "pts": "22.0 pts", "xg": "0.65", "tiros": "3.5", "tiros_arco": "1.8", "xa": "0.55"},
-        "Francia": {"query": "France", "figura": "Kylian Mbappé (DEL)", "pts": "23.5 pts", "xg": "0.85", "tiros": "4.2", "tiros_arco": "2.1", "xa": "0.30"},
-        "Brasil": {"query": "Brazil", "figura": "Vinicius Jr (DEL)", "pts": "19.5 pts", "xg": "0.60", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.40"},
-        "Inglaterra": {"query": "England", "figura": "Harry Kane (DEL)", "pts": "20.0 pts", "xg": "0.75", "tiros": "3.6", "tiros_arco": "1.7", "xa": "0.20"}
-    },
-    "Copa América": {
-        "Argentina": {"query": "Argentina", "figura": "Lionel Messi (DEL)", "pts": "22.0 pts", "xg": "0.65", "tiros": "3.5", "tiros_arco": "1.8", "xa": "0.55"},
-        "Brasil": {"query": "Brazil", "figura": "Vinicius Jr (DEL)", "pts": "19.5 pts", "xg": "0.60", "tiros": "3.2", "tiros_arco": "1.5", "xa": "0.40"},
-        "Uruguay": {"query": "Uruguay", "figura": "Darwin Núñez (DEL)", "pts": "18.5 pts", "xg": "0.70", "tiros": "3.8", "tiros_arco": "1.6", "xa": "0.15"},
-        "Colombia": {"query": "Colombia", "figura": "Luis Díaz (DEL)", "pts": "17.0 pts", "xg": "0.45", "tiros": "2.8", "tiros_arco": "1.2", "xa": "0.25"}
-    },
-    "Eurocopa": {
-        "España": {"query": "Spain", "figura": "Lamine Yamal (DEL)", "pts": "18.0 pts", "xg": "0.40", "tiros": "2.5", "tiros_arco": "1.1", "xa": "0.45"},
-        "Inglaterra": {"query": "England", "figura": "Jude Bellingham (MED)", "pts": "19.5 pts", "xg": "0.50", "tiros": "2.9", "tiros_arco": "1.3", "xa": "0.35"},
-        "Alemania": {"query": "Germany", "figura": "Jamal Musiala (MED)", "pts": "18.8 pts", "xg": "0.45", "tiros": "2.7", "tiros_arco": "1.2", "xa": "0.40"},
-        "Francia": {"query": "France", "figura": "Kylian Mbappé (DEL)", "pts": "23.5 pts", "xg": "0.85", "tiros": "4.2", "tiros_arco": "2.1", "xa": "0.30"}
+# =====================================================================
+# 2. PROYECCIONES DFS (manuales). Cada equipo una sola vez.
+#    (nombre, query de la API, figura, pts, xG, tiros, tiros al arco, xA)
+# =====================================================================
+_DFS_RAW = [
+    # Liga MX
+    ("Club América", "Club America", "Henry Martín (DEL)", "18.5", "0.65", "3.4", "1.8", "0.30"),
+    ("Cruz Azul", "Cruz Azul", "Ángel Sepúlveda (DEL)", "16.4", "0.58", "3.1", "1.5", "0.22"),
+    ("Monterrey (Rayados)", "Monterrey", "Sergio Canales (MED)", "17.9", "0.42", "3.2", "1.4", "0.45"),
+    ("Tigres UANL", "Tigres UANL", "A-P. Gignac (DEL)", "17.2", "0.62", "3.6", "1.7", "0.20"),
+    ("Toluca", "Toluca", "Paulinho (DEL)", "18.1", "0.68", "3.5", "1.8", "0.22"),
+    ("Pumas UNAM", "Pumas UNAM", "César Huerta (DEL)", "16.9", "0.45", "3.3", "1.4", "0.35"),
+    ("Guadalajara (Chivas)", "Guadalajara Chivas", "Roberto Alvarado (MED)", "15.8", "0.35", "2.8", "1.2", "0.42"),
+    ("Pachuca", "Pachuca", "Salomón Rondón (DEL)", "16.7", "0.60", "3.5", "1.6", "0.18"),
+    # Premier League
+    ("Arsenal", "Arsenal", "Bukayo Saka (DEL)", "19.2", "0.52", "3.2", "1.5", "0.48"),
+    ("Chelsea", "Chelsea", "Cole Palmer (MED)", "21.0", "0.65", "3.6", "1.8", "0.50"),
+    ("Liverpool", "Liverpool", "Mohamed Salah (DEL)", "20.4", "0.70", "3.8", "1.9", "0.42"),
+    ("Manchester City", "Manchester City", "Erling Haaland (DEL)", "22.5", "0.95", "4.2", "2.4", "0.12"),
+    ("Manchester United", "Manchester United", "Bruno Fernandes (MED)", "16.8", "0.35", "2.8", "1.1", "0.45"),
+    ("Tottenham", "Tottenham", "Son Heung-Min (DEL)", "18.5", "0.48", "3.1", "1.5", "0.35"),
+    # La Liga
+    ("Real Madrid", "Real Madrid", "Vinicius Jr (DEL)", "20.8", "0.68", "3.7", "1.8", "0.44"),
+    ("FC Barcelona", "Barcelona", "Lamine Yamal (DEL)", "19.5", "0.48", "3.3", "1.4", "0.52"),
+    ("Atlético de Madrid", "Atletico Madrid", "Antoine Griezmann (DEL)", "17.2", "0.45", "2.8", "1.2", "0.38"),
+    ("Athletic Club", "Athletic Club", "Iñaki Williams (DEL)", "14.5", "0.38", "2.5", "1.0", "0.22"),
+    ("Real Sociedad", "Real Sociedad", "Takefusa Kubo (MED)", "13.8", "0.30", "2.2", "0.9", "0.28"),
+    # Serie A
+    ("Inter de Milán", "Inter", "Lautaro Martínez (DEL)", "18.2", "0.60", "3.5", "1.6", "0.15"),
+    ("Juventus", "Juventus", "Dusan Vlahovic (DEL)", "16.5", "0.55", "3.1", "1.4", "0.10"),
+    ("AC Milan", "AC Milan", "Christian Pulisic (MED)", "17.0", "0.45", "2.9", "1.2", "0.35"),
+    ("Napoli", "Napoli", "Khvicha Kvaratskhelia (DEL)", "18.8", "0.50", "3.3", "1.5", "0.40"),
+    ("AS Roma", "Roma", "Paulo Dybala (DEL)", "15.8", "0.42", "2.6", "1.1", "0.32"),
+    # Bundesliga
+    ("Bayern Munich", "Bayern Munich", "Harry Kane (DEL)", "22.5", "0.85", "4.1", "2.2", "0.25"),
+    ("Bayer Leverkusen", "Bayer Leverkusen", "Florian Wirtz (MED)", "19.0", "0.40", "2.5", "1.1", "0.55"),
+    ("Borussia Dortmund", "Borussia Dortmund", "Julian Brandt (MED)", "15.5", "0.25", "1.8", "0.8", "0.45"),
+    ("RB Leipzig", "RB Leipzig", "Xavi Simons (MED)", "16.2", "0.32", "2.4", "1.0", "0.42"),
+    # Ligue 1
+    ("PSG", "Paris Saint Germain", "Bradley Barcola (DEL)", "19.5", "0.55", "3.2", "1.5", "0.30"),
+    ("Mónaco", "Monaco", "Aleksandr Golovin (MED)", "14.8", "0.20", "1.9", "0.7", "0.40"),
+    ("Marsella", "Marseille", "Mason Greenwood (DEL)", "17.2", "0.48", "2.8", "1.3", "0.25"),
+    # MLS
+    ("Inter Miami", "Inter Miami", "Lionel Messi (DEL)", "24.5", "0.75", "4.0", "2.0", "0.65"),
+    ("LAFC", "Los Angeles FC", "Denis Bouanga (DEL)", "20.1", "0.68", "3.8", "1.7", "0.25"),
+    ("LA Galaxy", "Los Angeles Galaxy", "Riqui Puig (MED)", "17.5", "0.30", "2.5", "1.0", "0.50"),
+    ("Columbus Crew", "Columbus Crew", "Cucho Hernández (DEL)", "19.0", "0.62", "3.5", "1.6", "0.30"),
+    # Brasil
+    ("Flamengo", "Flamengo", "Pedro (DEL)", "17.8", "0.60", "3.2", "1.5", "0.15"),
+    ("Palmeiras", "Palmeiras", "Raphael Veiga (MED)", "16.5", "0.35", "2.4", "1.0", "0.40"),
+    ("Botafogo", "Botafogo", "Tiquinho Soares (DEL)", "15.2", "0.45", "2.7", "1.2", "0.20"),
+    ("Fluminense", "Fluminense", "Germán Cano (DEL)", "17.5", "0.65", "3.4", "1.5", "0.10"),
+    # Argentina
+    ("River Plate", "River Plate", "Miguel Borja (DEL)", "18.0", "0.62", "3.3", "1.6", "0.10"),
+    ("Boca Juniors", "Boca Juniors", "Edinson Cavani (DEL)", "16.5", "0.50", "2.9", "1.3", "0.15"),
+    ("Racing Club", "Racing Club", "Adrián Martínez (DEL)", "15.8", "0.48", "2.8", "1.2", "0.12"),
+    # Portugal
+    ("Benfica", "Benfica", "Ángel Di María (MED)", "16.5", "0.35", "2.5", "1.0", "0.45"),
+    ("FC Porto", "FC Porto", "Evanilson (DEL)", "15.8", "0.50", "2.8", "1.2", "0.15"),
+    ("Sporting CP", "Sporting CP", "Viktor Gyökeres (DEL)", "21.0", "0.75", "4.0", "2.0", "0.25"),
+    # Países Bajos
+    ("PSV Eindhoven", "PSV Eindhoven", "Luuk de Jong (DEL)", "18.5", "0.65", "3.5", "1.5", "0.20"),
+    ("Feyenoord", "Feyenoord", "Santiago Giménez (DEL)", "17.0", "0.58", "3.2", "1.4", "0.15"),
+    ("Ajax", "Ajax", "Brian Brobbey (DEL)", "15.5", "0.50", "2.9", "1.3", "0.18"),
+    # Selecciones
+    ("Argentina", "Argentina", "Lionel Messi (DEL)", "22.0", "0.65", "3.5", "1.8", "0.55"),
+    ("Francia", "France", "Kylian Mbappé (DEL)", "23.5", "0.85", "4.2", "2.1", "0.30"),
+    ("Brasil", "Brazil", "Vinicius Jr (DEL)", "19.5", "0.60", "3.2", "1.5", "0.40"),
+    ("Inglaterra", "England", "Harry Kane (DEL)", "20.0", "0.75", "3.6", "1.7", "0.20"),
+    ("Uruguay", "Uruguay", "Darwin Núñez (DEL)", "18.5", "0.70", "3.8", "1.6", "0.15"),
+    ("Colombia", "Colombia", "Luis Díaz (DEL)", "17.0", "0.45", "2.8", "1.2", "0.25"),
+    ("España", "Spain", "Lamine Yamal (DEL)", "18.0", "0.40", "2.5", "1.1", "0.45"),
+    ("Alemania", "Germany", "Jamal Musiala (MED)", "18.8", "0.45", "2.7", "1.2", "0.40"),
+]
+
+# Nombres que la API escribe distinto a tus llaves (ya normalizados con clave())
+_ALIAS_API = {"bayern munchen": "Bayern Munich"}
+_STOP = {"fc", "cf", "cd", "club", "de"}
+
+
+def clave(texto: str) -> str:
+    """Normaliza un nombre: sin acentos, sin puntos, sin 'FC/Club/de', orden de palabras irrelevante."""
+    t = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode().lower()
+    t = re.sub(r"[.'’]", "", t)
+    tokens = [x for x in re.sub(r"[^a-z0-9]+", " ", t).split() if x not in _STOP]
+    return " ".join(sorted(tokens))
+
+
+_INDICE_DFS: dict[str, dict] = {}
+for _n, _q, _fig, _pts, _xg, _ti, _ta, _xa in _DFS_RAW:
+    _cfg = {"figura": _fig, "pts": _pts, "xg": _xg, "tiros": _ti, "tiros_arco": _ta, "xa": _xa}
+    for _alias in (_n, _q):
+        _INDICE_DFS.setdefault(clave(_alias), _cfg)
+for _k, _v in _ALIAS_API.items():
+    if clave(_v) in _INDICE_DFS:
+        _INDICE_DFS.setdefault(_k, _INDICE_DFS[clave(_v)])
+
+
+# =====================================================================
+# 3. MODELOS DE RESPUESTA
+# =====================================================================
+class EquipoRef(BaseModel):
+    id: int
+    nombre: str
+    logo: str | None = None
+
+
+class Equipo(EquipoRef):
+    tiene_dfs: bool = False
+
+
+class Partido(BaseModel):
+    fixture_id: int
+    fecha: str
+    ronda: str | None = None
+    estadio: str | None = None
+    local: Equipo
+    visita: Equipo
+
+
+class Forma(BaseModel):
+    partidos: int = 0
+    ganados: int = 0
+    empatados: int = 0
+    perdidos: int = 0
+    gf_prom: float | None = None
+    gc_prom: float | None = None
+    btts_pct: float | None = None
+    over15_pct: float | None = None
+    over25_pct: float | None = None
+    racha: str = ""  # más reciente primero
+
+
+class Detalle(BaseModel):
+    partidos: int = 0
+    tiros: float | None = None
+    tiros_arco: float | None = None
+    corners: float | None = None
+    faltas: float | None = None
+    amarillas: float | None = None
+    rojas: float | None = None
+
+
+class Marcador(BaseModel):
+    marcador: str
+    prob: float
+
+
+class Probabilidades(BaseModel):
+    local: float
+    empate: float
+    visita: float
+    over15: float
+    over25: float
+    over35: float
+    btts: float
+    goles_esperados_local: float
+    goles_esperados_visita: float
+    marcadores_probables: list[Marcador]
+
+
+class Dfs(BaseModel):
+    figura: str
+    puntos_esperados: float | None = None
+    xg: float | None = None
+    xa: float | None = None
+    tiros: float | None = None
+    tiros_arco: float | None = None
+    fuente: str = "manual"
+
+
+class Analisis(BaseModel):
+    local: EquipoRef
+    visita: EquipoRef
+    h2h: Forma
+    forma_local: Forma
+    forma_visita: Forma
+    detalle_local: Detalle | None = None
+    detalle_visita: Detalle | None = None
+    probabilidades: Probabilidades | None = None
+    dfs_local: Dfs | None = None
+    dfs_visita: Dfs | None = None
+    advertencias: list[str] = []
+
+
+def buscar_dfs(nombre: str) -> Dfs | None:
+    cfg = _INDICE_DFS.get(clave(nombre))
+    if not cfg:
+        return None
+
+    def f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    return Dfs(figura=cfg["figura"], puntos_esperados=f(cfg["pts"]), xg=f(cfg["xg"]),
+               xa=f(cfg["xa"]), tiros=f(cfg["tiros"]), tiros_arco=f(cfg["tiros_arco"]))
+
+
+# =====================================================================
+# 4. CACHÉ + CLIENTE API-FOOTBALL
+# =====================================================================
+class TTLCache:
+    """Caché en memoria con TTL; junta llamadas simultáneas idénticas en una sola."""
+
+    def __init__(self, max_items: int = 2000):
+        self._data: dict[Any, tuple[float, Any]] = {}
+        self._locks: dict[Any, asyncio.Lock] = {}
+        self._max = max_items
+
+    def _podar(self) -> None:
+        ahora = time.monotonic()
+        for k in [k for k, (exp_, _) in self._data.items() if exp_ <= ahora]:
+            self._data.pop(k, None)
+            self._locks.pop(k, None)
+        while len(self._data) > self._max:
+            k = next(iter(self._data))
+            self._data.pop(k, None)
+            self._locks.pop(k, None)
+
+    async def get_or_set(self, key: Any, ttl: int, factory: Callable[[], Awaitable[Any]]) -> Any:
+        hit = self._data.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            hit = self._data.get(key)
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+            valor = await factory()  # si falla, no se guarda nada
+            self._data[key] = (time.monotonic() + ttl, valor)
+            if len(self._data) > self._max:
+                self._podar()
+            return valor
+
+
+class ApiFootballError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+
+class ApiFootball:
+    def __init__(self):
+        self.cache = TTLCache()
+        self._sem = asyncio.Semaphore(MAX_CONCURRENTES)
+        if "rapidapi" in API_BASE:
+            headers = {"x-rapidapi-key": API_KEY or "", "x-rapidapi-host": API_BASE.split("//")[-1].split("/")[0]}
+        else:
+            headers = {"x-apisports-key": API_KEY or ""}
+        self._http = httpx.AsyncClient(base_url=API_BASE, headers=headers, timeout=httpx.Timeout(10.0))
+
+    async def cerrar(self) -> None:
+        await self._http.aclose()
+
+    async def _get(self, path: str, params: dict[str, Any], ttl: int) -> list[dict]:
+        if not API_KEY:
+            raise ApiFootballError(500, "Falta la variable de entorno API_FOOTBALL_KEY en el servidor.")
+        key = (path, tuple(sorted(params.items())))
+
+        async def fetch() -> list[dict]:
+            try:
+                async with self._sem:
+                    r = await self._http.get(path, params=params)
+                r.raise_for_status()
+                body = r.json()
+            except httpx.HTTPError as e:
+                raise ApiFootballError(502, f"Error al consultar API-Football: {e}") from e
+            if body.get("errors"):  # la API manda {} o [] cuando no hay errores
+                raise ApiFootballError(502, f"API-Football: {body['errors']}")
+            return body.get("response", [])
+
+        return await self.cache.get_or_set(key, ttl, fetch)
+
+    async def temporada_actual(self, liga_id: int) -> int:
+        r = await self._get("/leagues", {"id": liga_id, "current": "true"}, TTL_EQUIPOS)
+        if not r or not r[0].get("seasons"):
+            raise ApiFootballError(404, f"Sin temporada actual para la liga {liga_id}")
+        return r[0]["seasons"][0]["year"]
+
+    async def equipos_liga(self, liga_id: int, temporada: int) -> list[dict]:
+        r = await self._get("/teams", {"league": liga_id, "season": temporada}, TTL_EQUIPOS)
+        return [x["team"] for x in r]
+
+    async def equipo(self, team_id: int) -> dict:
+        r = await self._get("/teams", {"id": team_id}, TTL_EQUIPOS)
+        if not r:
+            raise ApiFootballError(404, f"Equipo {team_id} no encontrado")
+        return r[0]["team"]
+
+    async def proximos(self, liga_id: int, n: int) -> list[dict]:
+        return await self._get("/fixtures", {"league": liga_id, "next": n}, TTL_CARTELERA)
+
+    async def ultimos(self, team_id: int, n: int = 10) -> list[dict]:
+        return await self._get("/fixtures", {"team": team_id, "last": n}, TTL_HISTORIAL)
+
+    async def h2h(self, a: int, b: int, n: int = 10) -> list[dict]:
+        return await self._get("/fixtures/headtohead", {"h2h": f"{a}-{b}", "last": n}, TTL_HISTORIAL)
+
+    async def stats_partido(self, fixture_id: int) -> list[dict]:
+        return await self._get("/fixtures/statistics", {"fixture": fixture_id}, TTL_ESTADISTICAS)
+
+
+# =====================================================================
+# 5. ESTADÍSTICAS Y MODELO
+# =====================================================================
+TERMINADOS = {"FT", "AET", "PEN"}
+PRIOR_GOLES = 1.35
+K_SHRINK = 5
+FACTOR_LOCAL, FACTOR_VISITA = 1.10, 0.92
+
+
+def _terminado(f: dict) -> bool:
+    return (f["fixture"]["status"]["short"] in TERMINADOS
+            and f["goals"]["home"] is not None and f["goals"]["away"] is not None)
+
+
+def resumen_forma(fixtures: list[dict], team_id: int) -> Forma:
+    jugados = sorted((f for f in fixtures if _terminado(f)),
+                     key=lambda f: f["fixture"]["timestamp"], reverse=True)
+    n = len(jugados)
+    if n == 0:
+        return Forma()
+    gf = gc = g = e = p = btts = o15 = o25 = 0
+    racha = []
+    for f in jugados:
+        es_local = f["teams"]["home"]["id"] == team_id
+        a = f["goals"]["home" if es_local else "away"]
+        b = f["goals"]["away" if es_local else "home"]
+        gf += a
+        gc += b
+        if a > b:
+            g += 1
+            racha.append("G")
+        elif a == b:
+            e += 1
+            racha.append("E")
+        else:
+            p += 1
+            racha.append("P")
+        btts += a > 0 and b > 0
+        o15 += a + b > 1.5
+        o25 += a + b > 2.5
+    pc = lambda x: round(100 * x / n, 1)  # noqa: E731
+    return Forma(partidos=n, ganados=g, empatados=e, perdidos=p,
+                 gf_prom=round(gf / n, 2), gc_prom=round(gc / n, 2),
+                 btts_pct=pc(btts), over15_pct=pc(o15), over25_pct=pc(o25),
+                 racha="".join(racha[:5]))
+
+
+def _pois(k: int, lam: float) -> float:
+    return exp(-lam) * lam**k / factorial(k)
+
+
+def _ajustar(prom: float | None, n: int) -> float:
+    if prom is None:
+        return PRIOR_GOLES
+    return (prom * n + PRIOR_GOLES * K_SHRINK) / (n + K_SHRINK)
+
+
+def calcular_probabilidades(fl: Forma, fv: Forma, max_g: int = 10) -> Probabilidades:
+    lam_l = (_ajustar(fl.gf_prom, fl.partidos) + _ajustar(fv.gc_prom, fv.partidos)) / 2 * FACTOR_LOCAL
+    lam_v = (_ajustar(fv.gf_prom, fv.partidos) + _ajustar(fl.gc_prom, fl.partidos)) / 2 * FACTOR_VISITA
+    celdas = [(i, j, _pois(i, lam_l) * _pois(j, lam_v)) for i in range(max_g) for j in range(max_g)]
+    total = sum(c[2] for c in celdas)
+
+    def s(cond) -> float:
+        return round(sum(p for i, j, p in celdas if cond(i, j)) / total, 3)
+
+    top = sorted(celdas, key=lambda c: c[2], reverse=True)[:3]
+    return Probabilidades(
+        local=s(lambda i, j: i > j), empate=s(lambda i, j: i == j), visita=s(lambda i, j: i < j),
+        over15=s(lambda i, j: i + j > 1), over25=s(lambda i, j: i + j > 2),
+        over35=s(lambda i, j: i + j > 3), btts=s(lambda i, j: i > 0 and j > 0),
+        goles_esperados_local=round(lam_l, 2), goles_esperados_visita=round(lam_v, 2),
+        marcadores_probables=[Marcador(marcador=f"{i}-{j}", prob=round(p / total, 3)) for i, j, p in top],
+    )
+
+
+_MAPA_STATS = {"Total Shots": "tiros", "Shots on Goal": "tiros_arco", "Corner Kicks": "corners",
+               "Fouls": "faltas", "Yellow Cards": "amarillas", "Red Cards": "rojas"}
+_CERO_SI_NULO = {"amarillas", "rojas"}
+
+
+def _num(v):
+    try:
+        return float(str(v).strip("%"))
+    except (TypeError, ValueError):
+        return None
+
+
+async def detalle_equipo(api: ApiFootball, team_id: int, fixtures: list[dict], n: int = 5) -> Detalle:
+    recientes = sorted((f for f in fixtures if _terminado(f)),
+                       key=lambda f: f["fixture"]["timestamp"], reverse=True)[:n]
+    respuestas = await asyncio.gather(*(api.stats_partido(f["fixture"]["id"]) for f in recientes),
+                                      return_exceptions=True)
+    acum: dict[str, list[float]] = {v: [] for v in _MAPA_STATS.values()}
+    usados = 0
+    for r in respuestas:
+        if isinstance(r, Exception):
+            continue
+        bloque = next((b for b in r if b["team"]["id"] == team_id), None)
+        if not bloque:
+            continue
+        usados += 1
+        for st in bloque["statistics"]:
+            campo = _MAPA_STATS.get(st["type"])
+            if not campo:
+                continue
+            val = _num(st["value"])
+            if val is None and campo in _CERO_SI_NULO:
+                val = 0.0
+            if val is not None:
+                acum[campo].append(val)
+    return Detalle(partidos=usados,
+                   **{k: (round(sum(v) / len(v), 1) if v else None) for k, v in acum.items()})
+
+
+# =====================================================================
+# 6. APP Y RUTAS
+# =====================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.api = ApiFootball()
+    if not API_KEY:
+        logging.warning("API_FOOTBALL_KEY no está configurada")
+    yield
+    await app.state.api.cerrar()
+
+
+app = FastAPI(title="Panel Estadístico Draftea Pro", version="2.0", lifespan=lifespan)
+
+if CORS_ORIGINS:  # solo si el front vive en otro dominio
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["GET"], allow_headers=["*"])
+
+
+def get_api(request: Request) -> ApiFootball:
+    return request.app.state.api
+
+
+Api = Annotated[ApiFootball, Depends(get_api)]
+
+
+@app.exception_handler(ApiFootballError)
+async def _api_error(_: Request, exc: ApiFootballError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+def _ref(t: dict) -> EquipoRef:
+    return EquipoRef(id=t["id"], nombre=t["name"], logo=t.get("logo"))
+
+
+def _equipo(t: dict) -> Equipo:
+    return Equipo(id=t["id"], nombre=t["name"], logo=t.get("logo"), tiene_dfs=buscar_dfs(t["name"]) is not None)
+
+
+@app.get("/api/health")
+async def health():
+    return {"ok": True, "api_key_configurada": bool(API_KEY)}
+
+
+@app.get("/api/ligas")
+async def ligas():
+    return [{"id": i, "nombre": n} for i, n in LIGAS.items()]
+
+
+@app.get("/api/ligas/{liga_id}/equipos", response_model=list[Equipo])
+async def equipos(liga_id: int, api: Api):
+    if liga_id not in LIGAS:
+        raise HTTPException(404, "Liga no soportada")
+    temporada = await api.temporada_actual(liga_id)
+    return [_equipo(t) for t in await api.equipos_liga(liga_id, temporada)]
+
+
+@app.get("/api/ligas/{liga_id}/proximos", response_model=list[Partido])
+async def proximos(liga_id: int, api: Api, n: Annotated[int, Query(ge=1, le=30)] = 10):
+    if liga_id not in LIGAS:
+        raise HTTPException(404, "Liga no soportada")
+    items = await api.proximos(liga_id, n)
+    return [Partido(fixture_id=i["fixture"]["id"], fecha=i["fixture"]["date"],
+                    ronda=i["league"].get("round"), estadio=(i["fixture"].get("venue") or {}).get("name"),
+                    local=_equipo(i["teams"]["home"]), visita=_equipo(i["teams"]["away"]))
+            for i in items]
+
+
+@app.get("/api/analisis", response_model=Analisis)
+async def analisis(api: Api, local_id: int, visita_id: int,
+                   detalle: Annotated[bool, Query(description="Incluye tiros/córners/faltas (más llamadas)")] = False):
+    if local_id == visita_id:
+        raise HTTPException(422, "Elige dos equipos diferentes")
+
+    t_l, t_v, ult_l, ult_v, h2h = await asyncio.gather(
+        api.equipo(local_id), api.equipo(visita_id),
+        api.ultimos(local_id, 10), api.ultimos(visita_id, 10), api.h2h(local_id, visita_id, 10))
+
+    forma_l, forma_v = resumen_forma(ult_l, local_id), resumen_forma(ult_v, visita_id)
+    h2h_res = resumen_forma(h2h, local_id)
+
+    det_l = det_v = None
+    if detalle:
+        det_l, det_v = await asyncio.gather(detalle_equipo(api, local_id, ult_l),
+                                            detalle_equipo(api, visita_id, ult_v))
+
+    dfs_l, dfs_v = buscar_dfs(t_l["name"]), buscar_dfs(t_v["name"])
+
+    avisos = []
+    if h2h_res.partidos < 3:
+        avisos.append(f"H2H con solo {h2h_res.partidos} partido(s): no es una muestra confiable.")
+    if min(forma_l.partidos, forma_v.partidos) < 5:
+        avisos.append("Forma reciente con menos de 5 partidos en algún equipo; las probabilidades se acercan a la media.")
+    if not dfs_l or not dfs_v:
+        avisos.append("Sin proyección DFS cargada para alguno de los equipos.")
+    if dfs_l or dfs_v:
+        avisos.append("Las proyecciones DFS son valores cargados a mano, no calculados en vivo.")
+    avisos.append("Las probabilidades son un modelo Poisson simple basado en goles recientes; no considera lesiones ni alineaciones.")
+
+    return Analisis(local=_ref(t_l), visita=_ref(t_v), h2h=h2h_res,
+                    forma_local=forma_l, forma_visita=forma_v,
+                    detalle_local=det_l, detalle_visita=det_v,
+                    probabilidades=calcular_probabilidades(forma_l, forma_v),
+                    dfs_local=dfs_l, dfs_visita=dfs_v, advertencias=avisos)
+
+
+# =====================================================================
+# 7. FRONT (HTML plano, sin f-string)
+# =====================================================================
+PAGINA = r"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel Estadístico Draftea Pro</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b1329;color:#f8fafc;margin:0;padding:20px}
+.container{max-width:720px;margin:0 auto}
+label{display:block;font-size:11px;color:#94a3b8;text-transform:uppercase;margin-bottom:5px;font-weight:bold}
+select{background:#16203a;border:1px solid #334155;color:#fff;padding:10px 12px;border-radius:6px;font-size:14px;width:100%}
+.row{display:flex;gap:10px;margin:12px 0}.row>div{flex:1;min-width:0}
+.btn{background:#00ff87;color:#052e16;font-weight:bold;border:none;padding:12px;border-radius:6px;cursor:pointer;font-size:15px;width:100%}
+.btn:hover{background:#34d399}.btn:disabled{opacity:.6;cursor:wait}
+.check{display:flex;align-items:center;gap:8px;font-size:12px;color:#94a3b8;margin:8px 0 12px}
+.carousel{display:flex;gap:12px;overflow-x:auto;padding-bottom:12px;margin-bottom:16px}
+.match-card{background:#16203a;border:1px solid #233154;padding:12px;border-radius:10px;min-width:170px;cursor:pointer;text-align:center}
+.match-card:hover{border-color:#00ff87}
+.muted{color:#94a3b8;font-size:12px}.err{color:#ef4444;font-size:13px}
+.card{background:#16203a;border:1px solid #233154;border-radius:12px;padding:16px;margin-top:16px}
+.head{display:flex;justify-content:space-between;align-items:center}
+.side{display:flex;flex-direction:column;align-items:center;width:40%;text-align:center;font-weight:bold;font-size:15px}
+.side img{width:60px;height:60px;object-fit:contain;margin-bottom:6px}
+.vs{border:1px solid #38bdf8;color:#38bdf8;font-weight:bold;padding:4px 10px;border-radius:20px;font-size:12px}
+h3{font-size:12px;color:#00ff87;text-transform:uppercase;letter-spacing:.5px;margin:0 0 10px}
+.bar{display:flex;height:26px;border-radius:6px;overflow:hidden;font-size:12px;font-weight:bold}
+.bar div{display:flex;align-items:center;justify-content:center;min-width:34px}
+.b1{background:#0284c7}.b2{background:#64748b}.b3{background:#e11d48}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:7px 4px;border-top:1px solid #1e293b}td:first-child{text-align:left;font-weight:bold;width:25%}
+td:last-child{text-align:right;font-weight:bold;width:25%}td:nth-child(2){text-align:center;color:#38bdf8;font-size:12px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}.chip{background:#0b1329;border:1px solid #233154;border-radius:20px;padding:4px 10px;font-size:12px}
+.chip b{color:#38bdf8}
+.dfs{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.pl{background:#0b1329;border-left:3px solid #00ff87;padding:10px 12px;border-radius:6px;font-size:12px;color:#94a3b8}
+.pl .n{font-size:14px;font-weight:bold;color:#f8fafc;margin:3px 0}.pl .p{color:#00ff87;font-weight:bold;font-size:13px}
+.pl b{color:#38bdf8}
+.warn{font-size:12px;color:#fbbf24;margin:4px 0}
+.racha span{display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;border-radius:4px;font-size:11px;margin-right:3px}
+.G{background:#16a34a}.E{background:#ca8a04}.P{background:#dc2626}
+@media(max-width:520px){.dfs{grid-template-columns:1fr}}
+</style></head><body><div class="container">
+<h2>Panel Analítico Draftea ⚽</h2>
+<label>Liga</label><select id="liga"></select>
+<label style="margin-top:16px;color:#00ff87">Próximos partidos (clic para analizar)</label>
+<div id="cartelera" class="carousel"></div>
+<div class="row"><div><label>Local</label><select id="local"></select></div>
+<div><label>Visitante</label><select id="visita"></select></div></div>
+<label class="check"><input type="checkbox" id="detalle"> Incluir tiros, córners y faltas reales (usa más llamadas a la API)</label>
+<button class="btn" id="btn">Analizar enfrentamiento</button>
+<div id="resultado"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nd = x => (x === null || x === undefined) ? 'N/D' : x;
+const pc = x => (x === null || x === undefined) ? 'N/D' : x + '%';
+const fr = x => Math.round(x * 100) + '%';
+
+async function api(url) {
+  const r = await fetch(url);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || ('Error ' + r.status));
+  return d;
+}
+function opciones(sel, lista, idx) {
+  sel.innerHTML = lista.map(e => `<option value="${esc(e.id)}">${esc(e.nombre)}</option>`).join('');
+  if (idx !== undefined && sel.options[idx]) sel.selectedIndex = idx;
+}
+
+async function cargarLigas() {
+  const ligas = await api('/api/ligas');
+  $('liga').innerHTML = ligas.map(l => `<option value="${l.id}">${esc(l.nombre)}</option>`).join('');
+  await cambioLiga();
+}
+async function cambioLiga() {
+  const id = $('liga').value;
+  $('cartelera').innerHTML = '<span class="muted">Cargando…</span>';
+  $('local').innerHTML = $('visita').innerHTML = '';
+  const [eq, pr] = await Promise.allSettled([api(`/api/ligas/${id}/equipos`), api(`/api/ligas/${id}/proximos?n=10`)]);
+  if (eq.status === 'fulfilled') {
+    const lista = eq.value.sort((a, b) => a.nombre.localeCompare(b.nombre));
+    opciones($('local'), lista, 0); opciones($('visita'), lista, 1);
+  }
+  const c = $('cartelera');
+  if (pr.status === 'rejected') { c.innerHTML = `<span class="err">${esc(pr.reason.message)}</span>`; return; }
+  if (!pr.value.length) { c.innerHTML = '<span class="muted">No hay partidos próximos.</span>'; return; }
+  c.innerHTML = '';
+  pr.value.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'match-card';
+    d.innerHTML = `<div class="muted" style="color:#38bdf8;font-weight:bold">${esc(new Date(p.fecha).toLocaleString('es-MX', {dateStyle:'short', timeStyle:'short'}))}</div>
+      <div style="display:flex;justify-content:center;align-items:center;gap:8px;margin:8px 0">
+        <img src="${esc(p.local.logo)}" width="28"><span class="muted">VS</span><img src="${esc(p.visita.logo)}" width="28"></div>
+      <div style="font-size:11px;font-weight:bold;line-height:1.4">${esc(p.local.nombre)}<br>${esc(p.visita.nombre)}</div>`;
+    d.addEventListener('click', () => {
+      $('local').value = p.local.id; $('visita').value = p.visita.id;
+      analizar(p.local.id, p.visita.id);
+    });
+    c.appendChild(d);
+  });
+}
+
+const filas = rows => '<table>' + rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join('') + '</table>';
+const racha = r => '<span class="racha">' + [...(r || '')].map(x => `<span class="${x}">${x}</span>`).join('') + '</span>';
+const dfsCard = (rol, d) => !d ? `<div class="pl">${rol}<div class="n">Sin proyección cargada</div></div>` :
+  `<div class="pl">${rol}<div class="n">${esc(d.figura)}</div><div class="p">${nd(d.puntos_esperados)} pts esperados</div>
+   <div style="margin-top:6px">xG: <b>${nd(d.xg)}</b> · xA: <b>${nd(d.xa)}</b><br>Tiros: <b>${nd(d.tiros)}</b> · Al arco: <b>${nd(d.tiros_arco)}</b></div></div>`;
+
+async function analizar(lid, vid) {
+  const local = lid || $('local').value, visita = vid || $('visita').value, out = $('resultado');
+  if (!local || !visita) { out.innerHTML = '<p class="err">Elige los equipos.</p>'; return; }
+  if (local === visita) { out.innerHTML = '<p class="err">Elige dos equipos diferentes.</p>'; return; }
+  $('btn').disabled = true;
+  out.innerHTML = '<p class="muted">Analizando…</p>';
+  try {
+    const d = await api(`/api/analisis?local_id=${local}&visita_id=${visita}&detalle=${$('detalle').checked}`);
+    const p = d.probabilidades, fl = d.forma_local, fv = d.forma_visita, h = d.h2h;
+    let html = `<div class="card"><div class="head">
+      <div class="side"><img src="${esc(d.local.logo)}">${esc(d.local.nombre)}</div><div class="vs">VS</div>
+      <div class="side"><img src="${esc(d.visita.logo)}">${esc(d.visita.nombre)}</div></div></div>`;
+    if (p) {
+      html += `<div class="card"><h3>Probabilidades (modelo Poisson)</h3>
+        <div class="bar"><div class="b1" style="flex:${p.local}">${fr(p.local)}</div><div class="b2" style="flex:${p.empate}">${fr(p.empate)}</div><div class="b3" style="flex:${p.visita}">${fr(p.visita)}</div></div>
+        <div class="muted" style="display:flex;justify-content:space-between;margin:4px 0 12px"><span>Local</span><span>Empate</span><span>Visitante</span></div>
+        <div class="chips"><span class="chip">Over 1.5 <b>${fr(p.over15)}</b></span><span class="chip">Over 2.5 <b>${fr(p.over25)}</b></span>
+        <span class="chip">Over 3.5 <b>${fr(p.over35)}</b></span><span class="chip">Ambos anotan <b>${fr(p.btts)}</b></span>
+        <span class="chip">Goles esp. <b>${p.goles_esperados_local} – ${p.goles_esperados_visita}</b></span></div>
+        <div class="muted" style="margin-top:10px">Marcadores probables: ${p.marcadores_probables.map(m => `<b style="color:#38bdf8">${esc(m.marcador)}</b> (${fr(m.prob)})`).join(' · ')}</div></div>`;
     }
+    html += `<div class="card"><h3>Forma reciente (últimos ${Math.max(fl.partidos, fv.partidos)})</h3>` + filas([
+      [nd(fl.partidos), 'Partidos', nd(fv.partidos)],
+      [`${fl.ganados}-${fl.empatados}-${fl.perdidos}`, 'G-E-P', `${fv.ganados}-${fv.empatados}-${fv.perdidos}`],
+      [nd(fl.gf_prom), 'Goles a favor', nd(fv.gf_prom)], [nd(fl.gc_prom), 'Goles en contra', nd(fv.gc_prom)],
+      [pc(fl.over25_pct), 'Over 2.5', pc(fv.over25_pct)], [pc(fl.btts_pct), 'Ambos anotan', pc(fv.btts_pct)],
+      [racha(fl.racha), 'Racha', racha(fv.racha)]]) + '</div>';
+    html += `<div class="card"><h3>Historial directo (H2H)</h3>` + (h.partidos
+      ? filas([[nd(h.partidos), 'Partidos', nd(h.partidos)], [h.ganados, 'Victorias', h.perdidos], [h.empatados, 'Empates', h.empatados],
+               [nd(h.gf_prom), 'Goles prom.', nd(h.gc_prom)], [pc(h.over25_pct), 'Over 2.5', pc(h.over25_pct)], [pc(h.btts_pct), 'Ambos anotan', pc(h.btts_pct)]])
+      : '<span class="muted">Sin enfrentamientos recientes.</span>') + '</div>';
+    if (d.detalle_local && d.detalle_visita) {
+      const a = d.detalle_local, b = d.detalle_visita;
+      html += `<div class="card"><h3>Promedios reales (últimos ${Math.max(a.partidos, b.partidos)} con datos)</h3>` + filas([
+        [nd(a.tiros), 'Tiros totales', nd(b.tiros)], [nd(a.tiros_arco), 'Tiros al arco', nd(b.tiros_arco)],
+        [nd(a.corners), 'Córners', nd(b.corners)], [nd(a.faltas), 'Faltas', nd(b.faltas)],
+        [nd(a.amarillas), 'Amarillas', nd(b.amarillas)], [nd(a.rojas), 'Rojas', nd(b.rojas)]]) + '</div>';
+    }
+    html += `<div class="card"><h3>Jugadores clave (DFS)</h3><div class="dfs">${dfsCard('Local', d.dfs_local)}${dfsCard('Visitante', d.dfs_visita)}</div></div>`;
+    html += '<div class="card">' + d.advertencias.map(w => `<div class="warn">⚠ ${esc(w)}</div>`).join('') + '</div>';
+    out.innerHTML = html;
+    out.scrollIntoView({behavior: 'smooth'});
+  } catch (e) {
+    out.innerHTML = `<p class="err">${esc(e.message)}</p>`;
+  } finally { $('btn').disabled = false; }
 }
+
+$('liga').addEventListener('change', cambioLiga);
+$('btn').addEventListener('click', () => analizar());
+cargarLigas().catch(e => { $('cartelera').innerHTML = `<span class="err">${esc(e.message)}</span>`; });
+</script></body></html>"""
+
 
 @app.get("/", response_class=HTMLResponse)
-def leer_raiz():
-    ligas_json = json.dumps(LIGAS_CONFIG)
-    opciones_ligas = "".join([f'<option value="{liga}">{liga}</option>' for liga in LIGAS_CONFIG.keys()])
-
-    return f"""
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <title>Estadisticas Irvingsillo</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b1329; color: #f8fafc; padding: 25px; margin: 0; }}
-            .container {{ max-width: 680px; margin: 0 auto; }}
-            .control-group {{ margin-bottom: 12px; }}
-            label {{ display: block; font-size: 11px; color: #94a3b8; text-transform: uppercase; margin-bottom: 5px; font-weight: bold; }}
-            .search-box {{ display: flex; gap: 10px; margin-bottom: 16px; }}
-            select {{ background: #16203a; border: 1px solid #334155; color: #fff; padding: 10px 12px; border-radius: 6px; font-size: 14px; flex: 1; cursor: pointer; }}
-            select:focus {{ outline: none; border-color: #38bdf8; }}
-            .btn {{ background: #00ff87; color: #052e16; font-weight: bold; border: none; padding: 12px; border-radius: 6px; cursor: pointer; font-size: 15px; width: 100%; transition: 0.2s; }}
-            .btn:hover {{ background: #34d399; }}
-            .carousel {{ display: flex; gap: 12px; overflow-x: auto; padding-bottom: 15px; margin-bottom: 25px; scrollbar-width: thin; }}
-            .match-card {{ background: #16203a; border: 1px solid #233154; padding: 12px; border-radius: 10px; min-width: 170px; cursor: pointer; text-align: center; transition: 0.2s; }}
-            .match-card:hover {{ border-color: #00ff87; transform: translateY(-2px); }}
-            .match-header {{ display: flex; justify-content: space-between; align-items: center; margin-top: 25px; background: #16203a; border-radius: 12px 12px 0 0; padding: 20px; border: 1px solid #233154; border-bottom: none; }}
-            .team-side {{ display: flex; flex-direction: column; align-items: center; width: 40%; }}
-            .team-logo {{ width: 64px; height: 64px; object-fit: contain; margin-bottom: 8px; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.4)); }}
-            .team-name {{ font-size: 15px; font-weight: bold; text-align: center; color: #f8fafc; }}
-            .vs-badge {{ background: #0b1329; border: 1px solid #38bdf8; color: #38bdf8; font-weight: bold; padding: 4px 10px; border-radius: 20px; font-size: 12px; }}
-            .stat-table {{ width: 100%; background: #16203a; border-collapse: collapse; border: 1px solid #233154; }}
-            .stat-row {{ display: flex; justify-content: space-between; align-items: center; padding: 9px 16px; border-top: 1px solid #1e293b; font-size: 13px; }}
-            .stat-row:nth-child(even) {{ background: #111a30; }}
-            .stat-val-l {{ font-weight: bold; width: 25%; text-align: left; }}
-            .stat-name {{ width: 50%; text-align: center; color: #38bdf8; font-weight: 600; text-transform: capitalize; font-size: 12px; }}
-            .stat-val-v {{ font-weight: bold; width: 25%; text-align: right; }}
-            .pill {{ background: #0284c7; color: white; padding: 2px 8px; border-radius: 4px; display: inline-block; }}
-            .dfs-section {{ background: #16203a; border: 1px solid #233154; border-radius: 0 0 12px 12px; padding: 18px; margin-bottom: 30px; }}
-            .dfs-title {{ font-size: 12px; font-weight: bold; color: #00ff87; text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.5px; }}
-            .dfs-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-            .dfs-player-card {{ background: #0b1329; border-left: 3px solid #00ff87; padding: 12px 14px; border-radius: 6px; }}
-            .player-role {{ font-size: 11px; color: #94a3b8; font-weight: bold; }}
-            .player-name {{ font-size: 14px; font-weight: bold; color: #f8fafc; margin-top: 3px; }}
-            .player-pts-header {{ display: flex; justify-content: space-between; align-items: center; margin-top: 4px; margin-bottom: 10px; }}
-            .player-pts {{ font-size: 13px; color: #00ff87; font-weight: bold; }}
-            .player-stats-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; border-top: 1px solid #1e293b; padding-top: 8px; }}
-            .stat-mini {{ font-size: 11px; color: #94a3b8; }}
-            .stat-mini b {{ color: #38bdf8; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Panel Analítico Avanzado Draftea ⚽</h2>
-            
-            <div class="control-group">
-                <label>Selecciona la Liga:</label>
-                <select id="liga" onchange="cambioLiga()">
-                    {opciones_ligas}
-                </select>
-            </div>
-
-            <label style="color:#00ff87; margin-top:20px;">Próxima Jornada (Clickea para analizar)</label>
-            <div id="cartelera" class="carousel"></div>
-
-            <div class="search-box">
-                <div style="flex: 1;">
-                    <label>Local:</label>
-                    <select id="local"></select>
-                </div>
-                <div style="flex: 1;">
-                    <label>Visitante:</label>
-                    <select id="visita"></select>
-                </div>
-            </div>
-
-            <button class="btn" onclick="cargarAnalisis()">Analizar Enfrentamiento</button>
-            <div id="resultado"></div>
-        </div>
-
-        <script>
-            const ligasData = {ligas_json};
-
-            function actualizarEquipos() {{
-                const ligaSeleccionada = document.getElementById('liga').value;
-                const equipos = Object.keys(ligasData[ligaSeleccionada]);
-                const selectLocal = document.getElementById('local');
-                const selectVisita = document.getElementById('visita');
-
-                selectLocal.innerHTML = '';
-                selectVisita.innerHTML = '';
-
-                if (equipos.length === 0) {{
-                    const opt = document.createElement('option');
-                    opt.textContent = "Equipos pendientes de configurar";
-                    selectLocal.appendChild(opt.cloneNode(true));
-                    selectVisita.appendChild(opt);
-                    return;
-                }}
-
-                equipos.forEach((eq, index) => {{
-                    const optL = document.createElement('option');
-                    optL.value = eq;
-                    optL.textContent = eq;
-                    selectLocal.appendChild(optL);
-
-                    const optV = document.createElement('option');
-                    optV.value = eq;
-                    optV.textContent = eq;
-                    if (index === 1) optV.selected = true;
-                    selectVisita.appendChild(optV);
-                }});
-            }}
-
-            async function cargarCartelera() {{
-                const liga = document.getElementById('liga').value;
-                const cont = document.getElementById('cartelera');
-                cont.innerHTML = "<span style='color:#94a3b8; font-size:12px;'>Descargando calendario oficial...</span>";
-                
-                try {{
-                    const res = await fetch(`/proximos?liga=${{encodeURIComponent(liga)}}`);
-                    const data = await res.json();
-                    
-                    if (data.error || !data.resultados || data.resultados.length === 0) {{
-                        cont.innerHTML = "<span style='color:#ef4444; font-size:12px;'>No hay partidos registrados.</span>";
-                        return;
-                    }}
-
-                    let html = '';
-                    data.resultados.forEach(p => {{
-                        html += `
-                            <div class="match-card" onclick="seleccionarRapido('${{p.local_key}}', '${{p.visita_key}}')">
-                                <div style="font-size:10px; color:#38bdf8; margin-bottom:8px; font-weight:bold;">${{p.fecha}}</div>
-                                <div style="display:flex; justify-content:center; align-items:center; gap:8px;">
-                                    <img src="${{p.logo_l}}" width="28">
-                                    <span style="font-size:11px; color:#94a3b8;">VS</span>
-                                    <img src="${{p.logo_v}}" width="28">
-                                </div>
-                                <div style="font-size:11px; font-weight:bold; margin-top:10px; color:#f8fafc; line-height:1.4;">
-                                    ${{p.local}}<br>${{p.visita}}
-                                </div>
-                            </div>
-                        `;
-                    }});
-                    cont.innerHTML = html;
-                }} catch (e) {{
-                    cont.innerHTML = "<span style='color:#ef4444; font-size:12px;'>Error de red al cargar el calendario.</span>";
-                }}
-            }}
-
-            function seleccionarRapido(lKey, vKey) {{
-                const selectLocal = document.getElementById('local');
-                const selectVisita = document.getElementById('visita');
-                let foundL = false, foundV = false;
-                
-                for(let i=0; i<selectLocal.options.length; i++) {{
-                    if(selectLocal.options[i].value === lKey) {{ selectLocal.selectedIndex = i; foundL = true; }}
-                    if(selectVisita.options[i].value === vKey) {{ selectVisita.selectedIndex = i; foundV = true; }}
-                }}
-                
-                if(foundL && foundV) {{
-                    cargarAnalisis();
-                }} else {{
-                    alert("Aún no tienes los jugadores clave (DFS) configurados en la base de datos local para uno de estos equipos.");
-                }}
-            }}
-
-            function cambioLiga() {{
-                actualizarEquipos();
-                cargarCartelera();
-            }}
-
-            window.onload = function() {{
-                actualizarEquipos();
-                cargarCartelera();
-            }};
-
-            async function cargarAnalisis() {{
-                const liga = document.getElementById('liga').value;
-                const local = document.getElementById('local').value;
-                const visita = document.getElementById('visita').value;
-                const contenedor = document.getElementById('resultado');
-
-                if (!local || !visita || local === "Equipos pendientes de configurar") {{
-                    contenedor.innerHTML = "<p style='color: #f87171; margin-top: 15px;'>Faltan equipos por registrar en la base de datos.</p>";
-                    return;
-                }}
-
-                if (local === visita) {{
-                    contenedor.innerHTML = "<p style='color: #f87171; margin-top: 15px;'>Elige dos equipos diferentes.</p>";
-                    return;
-                }}
-
-                contenedor.innerHTML = "<p style='color: #94a3b8; margin-top: 15px;'>Verificando métricas y proyecciones H2H...</p>";
-                document.getElementById('resultado').scrollIntoView({{behavior: 'smooth'}});
-
-                try {{
-                    const res = await fetch(`/predicciones?liga=${{encodeURIComponent(liga)}}&local=${{encodeURIComponent(local)}}&visita=${{encodeURIComponent(visita)}}`);
-                    const data = await res.json();
-
-                    if (data.error) {{
-                        contenedor.innerHTML = `<p style="color: #ef4444; margin-top: 20px;">${{data.error}}</p>`;
-                        return;
-                    }}
-
-                    const d = data.resultado;
-                    const r = d.tabla;
-
-                    let filasHTML = '';
-                    r.forEach(item => {{
-                        filasHTML += `
-                            <div class="stat-row">
-                                <span class="stat-val-l">${{item.l_val}}</span>
-                                <span class="stat-name">${{item.metrica}}</span>
-                                <span class="stat-val-v">${{item.v_val}}</span>
-                            </div>
-                        `;
-                    }});
-
-                    contenedor.innerHTML = `
-                        <div class="match-header">
-                            <div class="team-side">
-                                <img src="${{d.logo_l}}" class="team-logo">
-                                <div class="team-name">${{d.local}}</div>
-                            </div>
-                            <div class="vs-badge">VS</div>
-                            <div class="team-side">
-                                <img src="${{d.logo_v}}" class="team-logo">
-                                <div class="team-name">${{d.visita}}</div>
-                            </div>
-                        </div>
-                        <div class="stat-table">
-                            ${{filasHTML}}
-                        </div>
-                        <div class="dfs-section">
-                            <div class="dfs-title">Proyección de Jugadores Clave (DFS / Draftea)</div>
-                            <div class="dfs-grid">
-                                <div class="dfs-player-card">
-                                    <div class="player-role">Top Pick Local</div>
-                                    <div class="player-name">${{d.dfs_l.figura}}</div>
-                                    <div class="player-pts-header">
-                                        <span class="player-pts">${{d.dfs_l.pts}} esperados</span>
-                                    </div>
-                                    <div class="player-stats-grid">
-                                        <div class="stat-mini">Posible Gol (xG): <b>${{d.dfs_l.xg}}</b></div>
-                                        <div class="stat-mini">Asistencia (xA): <b>${{d.dfs_l.xa}}</b></div>
-                                        <div class="stat-mini">Tiros Totales: <b>${{d.dfs_l.tiros}}</b></div>
-                                        <div class="stat-mini">Tiros al Arco: <b>${{d.dfs_l.tiros_arco}}</b></div>
-                                    </div>
-                                </div>
-                                <div class="dfs-player-card">
-                                    <div class="player-role">Top Pick Visitante</div>
-                                    <div class="player-name">${{d.dfs_v.figura}}</div>
-                                    <div class="player-pts-header">
-                                        <span class="player-pts">${{d.dfs_v.pts}} esperados</span>
-                                    </div>
-                                    <div class="player-stats-grid">
-                                        <div class="stat-mini">Posible Gol (xG): <b>${{d.dfs_v.xg}}</b></div>
-                                        <div class="stat-mini">Asistencia (xA): <b>${{d.dfs_v.xa}}</b></div>
-                                        <div class="stat-mini">Tiros Totales: <b>${{d.dfs_v.tiros}}</b></div>
-                                        <div class="stat-mini">Tiros al Arco: <b>${{d.dfs_v.tiros_arco}}</b></div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                }} catch (e) {{
-                    contenedor.innerHTML = `<p style="color: #ef4444; margin-top: 20px;">Error: ${{e.message}}</p>`;
-                }}
-            }}
-        </script>
-    </body>
-    </html>
-    """
-
-@app.get("/proximos")
-def obtener_proximos(liga: str = Query(...)):
-    id_liga = LIGAS_API_IDS.get(liga)
-    if not id_liga:
-        return {"error": "Liga no soportada."}
-        
-    partidos = api_futbol.obtener_proximos_partidos(id_liga)
-    
-    mapa_traduccion = {
-        "Club America": "Club América",
-        "Atletico San Luis": "Atlético San Luis",
-        "Guadalajara": "Guadalajara (Chivas)",
-        "Guadalajara Chivas": "Guadalajara (Chivas)",
-        "Monterrey": "Monterrey (Rayados)",
-        "Pumas UNAM": "Pumas UNAM",
-        "U.N.A.M.- Pumas": "Pumas UNAM",
-        "Club Tijuana": "Club Tijuana (Xolos)",
-        "Tijuana": "Club Tijuana (Xolos)",
-        "FC Juarez": "FC Juárez",
-        "Club Leon": "León",
-        "Leon": "León",
-        "Queretaro": "Querétaro"
-    }
-
-    for p in partidos:
-        p["local_key"] = mapa_traduccion.get(p["local"], p["local"])
-        p["visita_key"] = mapa_traduccion.get(p["visita"], p["visita"])
-
-    return {"resultados": partidos}
-
-@app.get("/predicciones")
-def obtener_predicciones(liga: str = Query(...), local: str = Query(...), visita: str = Query(...)):
-    liga_dict = LIGAS_CONFIG.get(liga)
-    if not liga_dict:
-        return {"error": "Liga no configurada para DFS en el servidor."}
-
-    cfg_l = liga_dict.get(local)
-    cfg_v = liga_dict.get(visita)
-
-    if not cfg_l or not cfg_v:
-        return {"error": "Equipos pendientes de registrar o sin historial DFS."}
-
-    info_club_l = api_futbol.obtener_info_club(cfg_l["query"])
-    info_club_v = api_futbol.obtener_info_club(cfg_v["query"])
-
-    if not info_club_l or not info_club_v:
-        return {"error": "No se pudieron obtener los datos de los clubes."}
-
-    historial = api_futbol.obtener_historial_h2h(info_club_l["id"], info_club_v["id"])
-
-    goles_l, goles_v, total_p = 0, 0, 0
-    btts_c = 0; over15_c = 0; over25_c = 0
-
-    if historial:
-        for p in historial:
-            gl = p['goals']['home']
-            gv = p['goals']['away']
-            if gl is not None and gv is not None:
-                total_p += 1
-                tot = gl + gv
-                if tot > 1.5: over15_c += 1
-                if tot > 2.5: over25_c += 1
-                if gl > 0 and gv > 0: btts_c += 1
-                
-                if p['teams']['home']['id'] == info_club_l["id"]:
-                    goles_l += gl
-                    goles_v += gv
-                else:
-                    goles_l += gv
-                    goles_v += gl
-
-    n = total_p if total_p > 0 else 5
-    prom_gf_l = round(goles_l / n, 1) if total_p > 0 else 1.6
-    prom_gf_v = round(goles_v / n, 1) if total_p > 0 else 1.2
-
-    tabla_estadisticas = [
-        {"l_val": f"<span class='pill'>{n}</span>", "metrica": "Partidos Analizados", "v_val": f"<span class='pill'>{n}</span>"},
-        {"l_val": prom_gf_l, "metrica": "Goles a Favor", "v_val": prom_gf_v},
-        {"l_val": prom_gf_v, "metrica": "Goles en Contra", "v_val": prom_gf_l},
-        {"l_val": f"<span class='pill'>{over15_c if total_p > 0 else 3}</span>", "metrica": "Over 1.5", "v_val": f"<span class='pill'>{over15_c if total_p > 0 else 3}</span>"},
-        {"l_val": f"<span class='pill'>{over25_c if total_p > 0 else 2}</span>", "metrica": "Over 2.5", "v_val": f"<span class='pill'>{over25_c if total_p > 0 else 2}</span>"},
-        {"l_val": f"<span class='pill'>{btts_c if total_p > 0 else 3}</span>", "metrica": "Ambos Anotan", "v_val": f"<span class='pill'>{btts_c if total_p > 0 else 3}</span>"},
-        {"l_val": "1.8", "metrica": "Tarjetas", "v_val": "2.4"},
-        {"l_val": "5.6", "metrica": "Córners a Favor", "v_val": "4.2"},
-        {"l_val": "13.4", "metrica": "Tiros Totales", "v_val": "10.8"},
-        {"l_val": "5.2", "metrica": "Tiros al Arco", "v_val": "3.8"},
-        {"l_val": "11.0", "metrica": "Faltas Cometidas", "v_val": "12.6"}
-    ]
-
-    return {
-        "resultado": {
-            "local": local,
-            "visita": visita,
-            "logo_l": info_club_l["logo"],
-            "logo_v": info_club_v["logo"],
-            "dfs_l": {"figura": cfg_l["figura"], "pts": cfg_l["pts"], "xg": cfg_l["xg"], "tiros": cfg_l["tiros"], "tiros_arco": cfg_l["tiros_arco"], "xa": cfg_l["xa"]},
-            "dfs_v": {"figura": cfg_v["figura"], "pts": cfg_v["pts"], "xg": cfg_v["xg"], "tiros": cfg_v["tiros"], "tiros_arco": cfg_v["tiros_arco"], "xa": cfg_v["xa"]},
-            "tabla": tabla_estadisticas
-        }
-    }
+async def raiz():
+    return PAGINA
