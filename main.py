@@ -10,6 +10,7 @@ import os
 import re
 import time
 import unicodedata
+from datetime import date, timedelta
 from contextlib import asynccontextmanager
 from math import exp, factorial
 from typing import Annotated, Any, Awaitable, Callable
@@ -317,8 +318,11 @@ class ApiFootball:
                 body = r.json()
             except httpx.HTTPError as e:
                 raise ApiFootballError(502, f"Error al consultar API-Football: {e}") from e
-            if body.get("errors"):  # la API manda {} o [] cuando no hay errores
-                raise ApiFootballError(502, f"API-Football: {body['errors']}")
+            errores = body.get("errors")
+            if errores:  # la API manda {} o [] cuando no hay errores
+                if isinstance(errores, dict) and ("plan" in errores or "access" in errores):
+                    raise ApiFootballError(402, f"Tu plan de API-Football no permite esta consulta: {errores}")
+                raise ApiFootballError(502, f"API-Football: {errores}")
             return body.get("response", [])
 
         return await self.cache.get_or_set(key, ttl, fetch)
@@ -339,14 +343,19 @@ class ApiFootball:
             raise ApiFootballError(404, f"Equipo {team_id} no encontrado")
         return r[0]["team"]
 
-    async def proximos(self, liga_id: int, n: int) -> list[dict]:
-        return await self._get("/fixtures", {"league": liga_id, "next": n}, TTL_CARTELERA)
+    # Sin los parámetros next/last (no existen en el plan gratuito):
+    # se pide por rango de fechas / temporada y se recorta localmente.
+    async def proximos(self, liga_id: int, temporada: int, dias: int = 30) -> list[dict]:
+        hoy = date.today()
+        params = {"league": liga_id, "season": temporada,
+                  "from": hoy.isoformat(), "to": (hoy + timedelta(days=dias)).isoformat()}
+        return await self._get("/fixtures", params, TTL_CARTELERA)
 
-    async def ultimos(self, team_id: int, n: int = 10) -> list[dict]:
-        return await self._get("/fixtures", {"team": team_id, "last": n}, TTL_HISTORIAL)
+    async def ultimos(self, team_id: int, temporada: int) -> list[dict]:
+        return await self._get("/fixtures", {"team": team_id, "season": temporada}, TTL_HISTORIAL)
 
-    async def h2h(self, a: int, b: int, n: int = 10) -> list[dict]:
-        return await self._get("/fixtures/headtohead", {"h2h": f"{a}-{b}", "last": n}, TTL_HISTORIAL)
+    async def h2h(self, a: int, b: int) -> list[dict]:
+        return await self._get("/fixtures/headtohead", {"h2h": f"{a}-{b}"}, TTL_HISTORIAL)
 
     async def stats_partido(self, fixture_id: int) -> list[dict]:
         return await self._get("/fixtures/statistics", {"fixture": fixture_id}, TTL_ESTADISTICAS)
@@ -366,9 +375,9 @@ def _terminado(f: dict) -> bool:
             and f["goals"]["home"] is not None and f["goals"]["away"] is not None)
 
 
-def resumen_forma(fixtures: list[dict], team_id: int) -> Forma:
+def resumen_forma(fixtures: list[dict], team_id: int, n_max: int = 10) -> Forma:
     jugados = sorted((f for f in fixtures if _terminado(f)),
-                     key=lambda f: f["fixture"]["timestamp"], reverse=True)
+                     key=lambda f: f["fixture"]["timestamp"], reverse=True)[:n_max]
     n = len(jugados)
     if n == 0:
         return Forma()
@@ -527,7 +536,8 @@ async def equipos(liga_id: int, api: Api):
 async def proximos(liga_id: int, api: Api, n: Annotated[int, Query(ge=1, le=30)] = 10):
     if liga_id not in LIGAS:
         raise HTTPException(404, "Liga no soportada")
-    items = await api.proximos(liga_id, n)
+    temporada = await api.temporada_actual(liga_id)
+    items = sorted(await api.proximos(liga_id, temporada), key=lambda i: i["fixture"]["timestamp"])[:n]
     return [Partido(fixture_id=i["fixture"]["id"], fecha=i["fixture"]["date"],
                     ronda=i["league"].get("round"), estadio=(i["fixture"].get("venue") or {}).get("name"),
                     local=_equipo(i["teams"]["home"]), visita=_equipo(i["teams"]["away"]))
@@ -535,14 +545,17 @@ async def proximos(liga_id: int, api: Api, n: Annotated[int, Query(ge=1, le=30)]
 
 
 @app.get("/api/analisis", response_model=Analisis)
-async def analisis(api: Api, local_id: int, visita_id: int,
+async def analisis(api: Api, local_id: int, visita_id: int, liga_id: int,
                    detalle: Annotated[bool, Query(description="Incluye tiros/córners/faltas (más llamadas)")] = False):
     if local_id == visita_id:
         raise HTTPException(422, "Elige dos equipos diferentes")
 
+    if liga_id not in LIGAS:
+        raise HTTPException(404, "Liga no soportada")
+    temporada = await api.temporada_actual(liga_id)
     t_l, t_v, ult_l, ult_v, h2h = await asyncio.gather(
         api.equipo(local_id), api.equipo(visita_id),
-        api.ultimos(local_id, 10), api.ultimos(visita_id, 10), api.h2h(local_id, visita_id, 10))
+        api.ultimos(local_id, temporada), api.ultimos(visita_id, temporada), api.h2h(local_id, visita_id))
 
     forma_l, forma_v = resumen_forma(ult_l, local_id), resumen_forma(ult_v, visita_id)
     h2h_res = resumen_forma(h2h, local_id)
@@ -690,7 +703,7 @@ async function analizar(lid, vid) {
   $('btn').disabled = true;
   out.innerHTML = '<p class="muted">Analizando…</p>';
   try {
-    const d = await api(`/api/analisis?local_id=${local}&visita_id=${visita}&detalle=${$('detalle').checked}`);
+    const d = await api(`/api/analisis?local_id=${local}&visita_id=${visita}&liga_id=${$('liga').value}&detalle=${$('detalle').checked}`);
     const p = d.probabilidades, fl = d.forma_local, fv = d.forma_visita, h = d.h2h;
     let html = `<div class="card"><div class="head">
       <div class="side"><img src="${esc(d.local.logo)}">${esc(d.local.nombre)}</div><div class="vs">VS</div>
