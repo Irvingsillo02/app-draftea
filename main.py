@@ -908,7 +908,7 @@ td:last-child{text-align:right;font-weight:bold;width:25%}td:nth-child(2){text-a
 .tv tr.val td{color:#00ff87;background:#0b1f1a}
 @media(max-width:520px){.dfs{grid-template-columns:1fr}}
 </style></head><body><div class="container">
-<h2>Panel Analítico Draftea ⚽</h2>
+<h2>Panel Irvingsillo ⚽</h2>
 <label>Liga</label><select id="liga"></select>
 <label style="margin-top:16px;color:#00ff87">Próximos partidos (clic para analizar)</label>
 <div id="cartelera" class="carousel"></div>
